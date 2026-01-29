@@ -7,4 +7,4 @@ class Player(Base):
     __tablename__ = "players"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    handle: Mapped[str] = mapped_column(String(64), index=True)
+    handle: Mapped[str] = mapped_column(String(64), index=True, unique=True)

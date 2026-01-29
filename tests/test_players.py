@@ -29,7 +29,7 @@ def client():
 
 def test_create_and_list_players(client: TestClient):
     r = client.post("/api/v1/players", json={"handle": "s1mple"})
-    assert r.status_code == 200
+    assert r.status_code == 201
     data = r.json()
     assert data["handle"] == "s1mple"
     assert isinstance(data["id"], int)
@@ -39,3 +39,10 @@ def test_create_and_list_players(client: TestClient):
     players = r2.json()
     assert len(players) == 1
     assert players[0]["handle"] == "s1mple"
+
+def test_duplicate_handle_returns_409(client: TestClient):
+    r1 = client.post("/api/v1/players", json={"handle": "donk"})
+    assert r1.status_code == 201
+
+    r2 = client.post("/api/v1/players", json={"handle": "donk"})
+    assert r2.status_code == 409

@@ -1,4 +1,5 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
@@ -7,11 +8,17 @@ from app.schemas.player import PlayerCreate, PlayerRead
 
 router = APIRouter(prefix="/players", tags=["players"])
 
-@router.post("", response_model=PlayerRead)
+@router.post("", response_model=PlayerRead, status_code=status.HTTP_201_CREATED)
 def create_player(payload: PlayerCreate, db: Session = Depends(get_db)):
     player = Player(handle=payload.handle)
     db.add(player)
-    db.commit()
+
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Player already exists in the database")
+
     db.refresh(player)
     return player
 
