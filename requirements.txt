@@ -23,3 +23,8 @@ mypy
 beautifulsoup4
 cloudscraper
 lxml
+
+tqdm
+pandas
+playwright
+playwright-stealth

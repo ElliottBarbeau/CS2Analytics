@@ -7,8 +7,6 @@ import cloudscraper
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
-
-import requests
 from bs4 import BeautifulSoup
 
 
