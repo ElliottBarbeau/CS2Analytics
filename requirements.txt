@@ -19,3 +19,7 @@ pytest-asyncio
 black
 ruff
 mypy
+
+beautifulsoup4
+cloudscraper
+lxml
