@@ -16,13 +16,7 @@ CSV_PATH = "data/processed/hltv_top30_match_urls.csv"
 OUT_VETO_JSONL = "data/raw/hltv_veto.jsonl"
 OUT_STATS_JSONL = "data/raw/hltv_player_stats.jsonl"
 
-MIN_SLEEP = 0.8
-MAX_SLEEP = 1.8
 MATCH_ID_RE = re.compile(r"/matches/(\d+)/")
-
-
-def sleep_jitter():
-    time.sleep(random.uniform(MIN_SLEEP, MAX_SLEEP))
 
 
 def fetch(scraper, url: str) -> str:
@@ -40,47 +34,45 @@ def extract_match_id(match_url: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
-def parse_veto(match_html: str) -> Dict[str, Any]:
+def parse_veto(match_html):
     soup = BeautifulSoup(match_html, "lxml")
+    boxes = soup.select(".veto-box")
+    if not boxes:
+        return {"raw_lines": [], "actions": []}
 
-    veto_box = soup.select_one(".veto-box")
-    if not veto_box:
-        veto_candidates = soup.find_all(
-            lambda tag: tag.name in ("div", "section")
-            and tag.get("class")
-            and any("veto" in c for c in tag.get("class", []))
-        )
-        veto_box = veto_candidates[0] if veto_candidates else None
+    def score(box):
+        t = box.get_text(" ", strip=True).lower()
+        return sum(k in t for k in (" removed ", " picked ", " banned ", " left over")) + (1 if re.search(r"\b1\.\s", t) else 0)
 
-    raw_lines: List[str] = []
-    if veto_box:
-        text = veto_box.get_text("\n", strip=True)
-        raw_lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    box = max(boxes, key=score)
+    lines = []
+
+    for div in box.select(".padding > div"):
+        t = div.get_text(" ", strip=True)
+        if t:
+            lines.append(t)
+
+    if not lines:
+        text = box.get_text("\n", strip=True)
+        lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
 
     actions = []
-    for ln in raw_lines:
-        m = re.match(r"^(?P<team>.+?)\s+(?P<action>removed|banned|picked)\s+(?P<map>.+?)$", ln, re.I)
+    for ln in lines:
+        ln2 = re.sub(r"^\s*\d+\.\s*", "", ln).strip()
+
+        m = re.match(r"^(?P<team>.+?)\s+(?P<action>removed|banned|picked)\s+(?P<map>.+?)$", ln2, re.I)
         if m:
-            actions.append({
-                "team": m.group("team"),
-                "action": m.group("action").lower(),
-                "map": m.group("map"),
-                "raw": ln
-            })
+            actions.append({"team": m.group("team"), "action": m.group("action").lower(), "map": m.group("map"), "raw": ln})
             continue
-        m2 = re.match(r"^(?P<map>.+?)\s+was\s+left\s+over$", ln, re.I)
+
+        m2 = re.match(r"^(?P<map>.+?)\s+was\s+left\s+over$", ln2, re.I)
         if m2:
-            actions.append({
-                "team": None,
-                "action": "left_over",
-                "map": m2.group("map"),
-                "raw": ln
-            })
+            actions.append({"team": None, "action": "left_over", "map": m2.group("map"), "raw": ln})
             continue
 
         actions.append({"team": None, "action": None, "map": None, "raw": ln})
 
-    return {"raw_lines": raw_lines, "actions": actions}
+    return {"raw_lines": lines, "actions": actions}
 
 
 def parse_player_tables_from_match_page(match_html):
@@ -143,7 +135,6 @@ def main():
     scraper = cloudscraper.create_scraper()
 
     fetch(scraper, "https://www.hltv.org/")
-    sleep_jitter()
 
     with open(OUT_VETO_JSONL, "w", encoding="utf-8") as fveto, \
          open(OUT_STATS_JSONL, "w", encoding="utf-8") as fstats:
@@ -190,7 +181,6 @@ def main():
                     "error": err,
                 }, ensure_ascii=False) + "\n")
 
-            sleep_jitter()
 
     print("Done.")
     print(f"Wrote veto -> {OUT_VETO_JSONL}")
