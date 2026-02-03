@@ -66,6 +66,7 @@ def parse_match_links(html: str) -> List[Tuple[int, str]]:
     soup = BeautifulSoup(html, "lxml")
     out: List[Tuple[int, str]] = []
     seen: Set[int] = set()
+
     for a in soup.select('a[href^="/matches/"]'):
         href = a.get("href") or ""
         m = MATCH_RE.match(href)
@@ -76,6 +77,7 @@ def parse_match_links(html: str) -> List[Tuple[int, str]]:
             continue
         seen.add(match_id)
         out.append((match_id, BASE + href))
+
     return out
 
 
@@ -162,7 +164,9 @@ def main() -> None:
     args = ap.parse_args()
 
     team_id = args.team
-    if team_id not in set(TOP_30):
+    top_set: Set[int] = set(TOP_30)
+
+    if team_id not in top_set:
         raise RuntimeError("team id not in TOP_30 list")
 
     out_dir = Path(args.out_dir)
@@ -177,7 +181,6 @@ def main() -> None:
     min_keep_ts = CS2_START_TS if last_ts is None else max(CS2_START_TS, last_ts)
 
     scraper = cloudscraper.create_scraper()
-    top_set: Set[int] = set(TOP_30)
 
     write_header = not out_csv.exists() or out_csv.stat().st_size == 0
 
@@ -185,6 +188,7 @@ def main() -> None:
     wrote = 0
     stopped = False
     completed = False
+    empty_pages_in_a_row = 0
 
     pbar = tqdm(total=args.max_pages, desc=f"HLTV pages team={team_id}", unit="page")
 
@@ -201,17 +205,31 @@ def main() -> None:
             while pages < args.max_pages:
                 url = f"{RESULTS_URL}?team={team_id}&offset={offset}"
 
-                html = fetch_html(url, scraper, args.timeout)
-                if not html:
+                results_html = fetch_html(url, scraper, args.timeout)
+                if not results_html:
                     break
 
-                links = parse_match_links(html)
+                links = parse_match_links(results_html)
                 if not links:
-                    break
+                    empty_pages_in_a_row += 1
+                    if empty_pages_in_a_row >= 2:
+                        break
+                    pages += 1
+                    offset += 100
+                    pbar.update(1)
+                    time.sleep(args.delay)
+                    continue
+
+                empty_pages_in_a_row = 0
+
+                any_new_written_on_page = 0
+                any_new_seen_on_page = 0
 
                 for match_id, match_url in links:
                     if match_id in existing_match_ids:
                         continue
+
+                    any_new_seen_on_page += 1
 
                     match_html = fetch_html(match_url, scraper, args.timeout)
                     if not match_html:
@@ -232,8 +250,12 @@ def main() -> None:
                         time.sleep(args.match_delay)
                         continue
 
+                    if team_id not in (t1_id, t2_id):
+                        time.sleep(args.match_delay)
+                        continue
+
                     if t1_id not in top_set or t2_id not in top_set:
-                        time.sleep(args.match-delay if False else args.match_delay)
+                        time.sleep(args.match_delay)
                         continue
 
                     writer.writerow(
@@ -246,6 +268,7 @@ def main() -> None:
                     f.flush()
                     existing_match_ids.add(match_id)
                     wrote += 1
+                    any_new_written_on_page += 1
 
                     time.sleep(args.match_delay)
 
@@ -254,6 +277,12 @@ def main() -> None:
                 pbar.update(1)
 
                 if stopped:
+                    break
+
+                if any_new_seen_on_page == 0:
+                    break
+
+                if any_new_written_on_page == 0 and last_ts is not None:
                     break
 
                 time.sleep(args.delay)
@@ -268,7 +297,7 @@ def main() -> None:
         save_last_ts(last_ts_path, newest_ts_seen)
 
     print(
-        f"[DONE] wrote={wrote} out={out_csv} last_ts_saved={newest_ts_seen if (completed and newest_ts_seen is not None) else 'NO'}"
+        f"[DONE] team={team_id} wrote={wrote} out={out_csv} last_ts_saved={newest_ts_seen if (completed and newest_ts_seen is not None) else 'NO'}"
     )
 
 
