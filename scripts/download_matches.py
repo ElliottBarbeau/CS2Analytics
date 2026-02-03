@@ -15,8 +15,8 @@ from bs4 import BeautifulSoup
 from tqdm import tqdm
 
 
-CSV_PATH_DEFAULT = "data/processed/hltv_top30_match_urls.csv"
-OUT_JSONL_DEFAULT = "data/raw/hltv_match_veto_and_stats.jsonl"
+OUT_DIR_DEFAULT = "data/raw"
+
 
 MATCH_ID_RE = re.compile(r"/matches/(\d+)/", re.IGNORECASE)
 STATS_MATCH_LINK_RE = re.compile(r"^/stats/matches/(?:(mapstatsid)/)?(\d+)/(.+)$", re.IGNORECASE)
@@ -89,14 +89,14 @@ def parse_match_timestamp(match_html: str) -> Optional[int]:
             if v.isdigit():
                 ts = int(v)
                 if ts > 10_000_000_000:
-                    ts = ts // 1000
+                    ts //= 1000
                 return ts
 
     m = re.search(r'data-unix\s*=\s*"(\d+)"', match_html)
     if m:
         ts = int(m.group(1))
         if ts > 10_000_000_000:
-            ts = ts // 1000
+            ts //= 1000
         return ts
 
     return None
@@ -122,10 +122,7 @@ def parse_veto(match_html: str) -> Dict[str, Any]:
 
     def score(box) -> int:
         t = box.get_text(" ", strip=True).lower()
-        return (
-            sum(k in t for k in (" removed ", " picked ", " banned ", " left over"))
-            + (1 if re.search(r"\b1\.\s", t) else 0)
-        )
+        return sum(k in t for k in (" removed ", " picked ", " banned ", " left over"))
 
     box = max(boxes, key=score)
     lines: List[str] = []
@@ -309,19 +306,23 @@ def read_match_urls_from_csv(path: Path, url_column: str) -> List[str]:
 
 
 def main() -> None:
-    scraper = cloudscraper.create_scraper()
     ap = argparse.ArgumentParser()
-    ap.add_argument("--csv", default=CSV_PATH_DEFAULT)
+    ap.add_argument("--team", type=int, required=True)
     ap.add_argument("--url-column", default="match_url")
-    ap.add_argument("--out", default=OUT_JSONL_DEFAULT)
+    ap.add_argument("--out-dir", default=OUT_DIR_DEFAULT)
     ap.add_argument("--max-matches", type=int, default=None)
-    ap.add_argument("--delay", type=float, default=1.2)
+    ap.add_argument("--delay", type=float, default=0.1)
     ap.add_argument("--timeout", type=int, default=30)
     args = ap.parse_args()
 
-    csv_path = Path(args.csv)
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    csv_path = Path(f"data/processed/hltv_matches_{args.team}.csv")
+    out_dir = Path(args.out_dir)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    out_path = out_dir / f"hltv_match_veto_and_stats_{args.team}.jsonl"
+
+    scraper = cloudscraper.create_scraper()
 
     match_urls = read_match_urls_from_csv(csv_path, args.url_column)
     if args.max_matches is not None:
@@ -330,10 +331,13 @@ def main() -> None:
     blocked = 0
     failed = 0
     no_stats_ref = 0
+    written = 0
 
     with out_path.open("w", encoding="utf-8") as fout:
-        for match_url in tqdm(match_urls, desc="Fetching HLTV"):
+        for match_url in tqdm(match_urls, desc=f"Fetching HLTV team={args.team}"):
             match_id = extract_match_id(match_url)
+            if match_id is None:
+                continue
 
             try:
                 match_html = fetch(scraper, match_url)
@@ -343,7 +347,6 @@ def main() -> None:
 
                 ref = extract_stats_match_ref(match_html)
                 if not ref:
-                    print("FAILED")
                     no_stats_ref += 1
                     fout.write(
                         json.dumps(
@@ -357,41 +360,39 @@ def main() -> None:
                         )
                         + "\n"
                     )
+                    written += 1
+                    print("NO STATS MATCH REF")
+                    time.sleep(args.delay)
                     continue
 
                 kind, stats_id, slug = ref
                 stats_urls = build_stats_urls(kind, stats_id, slug)
 
                 base_html = fetch(scraper, stats_urls["base"])
-                #perf_html = fetch(scraper, stats_urls["performance"])
-
-                #perf_table_count = perf_html.lower().count("<table")
-                #if perf_table_count == 0:
-                    #with open("debug_performance.html", "w", encoding="utf-8") as f:
-                        #f.write(perf_html)
-
-
                 base_tables = parse_all_tables(base_html)
-                #perf_tables = parse_all_tables(perf_html)
-
                 map_results = parse_map_results(match_html)
 
-                #print(perf_tables)
+                fout.write(
+                    json.dumps(
+                        {
+                            "match_id": match_id,
+                            "match_url": match_url,
+                            "team1_name": team1_name,
+                            "team2_name": team2_name,
+                            "timestamp": timestamp,
+                            "veto": veto,
+                            "map_results": map_results,
+                            "stats_match_id": stats_id,
+                            "stats_match_slug": slug,
+                            "stats_urls": stats_urls,
+                            "base_tables": base_tables,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
 
-                fout.write(json.dumps({
-                    "match_id": match_id,
-                    "match_url": match_url,
-                    "team1_name": team1_name,
-                    "team2_name": team2_name,
-                    "timestamp": timestamp,
-                    "veto": veto,
-                    "map_results": map_results,
-                    "stats_match_id": stats_id,
-                    "stats_match_slug": slug,
-                    "stats_urls": stats_urls,
-                    "base_tables": base_tables,
-                    #"performance_tables": perf_tables,
-                }, ensure_ascii=False) + "\n")
+                written += 1
 
             except Exception as e:
                 msg = f"{type(e).__name__}: {e}"
@@ -412,8 +413,14 @@ def main() -> None:
                     + "\n"
                 )
 
+                written += 1
+
+            time.sleep(args.delay)
+
     print(f"Wrote -> {out_path}")
-    print(f"blocked={blocked} failed={failed} no_stats_ref={no_stats_ref} total={len(match_urls)}")
+    print(
+        f"team={args.team} written={written} blocked={blocked} failed={failed} no_stats_ref={no_stats_ref} total={len(match_urls)}"
+    )
 
 
 if __name__ == "__main__":
