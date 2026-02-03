@@ -18,6 +18,8 @@ TEAM_RE = re.compile(r"^/team/(\d+)/")
 MATCH_RE = re.compile(r"^/matches/(\d+)/")
 UNIX_RE = re.compile(r'data-unix\s*=\s*"(\d+)"', re.I)
 
+CS2_START_TS = 1695772800
+
 TOP_30 = [
     8297,  # Furia
     11283,  # Falcons
@@ -153,7 +155,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--team", type=int, required=True)
     ap.add_argument("--out-dir", default="data/processed")
-    ap.add_argument("--delay", type=float, default=1.2)
+    ap.add_argument("--delay", type=float, default=0.1)
     ap.add_argument("--match-delay", type=float, default=0.25)
     ap.add_argument("--timeout", type=int, default=30)
     ap.add_argument("--max-pages", type=int, default=200)
@@ -172,6 +174,8 @@ def main() -> None:
     existing_match_ids = load_existing_match_ids(out_csv)
     last_ts = load_last_ts(last_ts_path)
 
+    min_keep_ts = CS2_START_TS if last_ts is None else max(CS2_START_TS, last_ts)
+
     scraper = cloudscraper.create_scraper()
     top_set: Set[int] = set(TOP_30)
 
@@ -179,7 +183,7 @@ def main() -> None:
 
     newest_ts_seen: Optional[int] = None
     wrote = 0
-    stopped_on_ts = False
+    stopped = False
     completed = False
 
     pbar = tqdm(total=args.max_pages, desc=f"HLTV pages team={team_id}", unit="page")
@@ -191,7 +195,6 @@ def main() -> None:
                 writer.writeheader()
                 f.flush()
 
-            print(f"[TEAM] {team_id} last_ts={last_ts if last_ts is not None else 'NONE'}")
             offset = 0
             pages = 0
 
@@ -218,9 +221,11 @@ def main() -> None:
                     if ts is not None:
                         if newest_ts_seen is None or ts > newest_ts_seen:
                             newest_ts_seen = ts
-                        if last_ts is not None and ts < last_ts:
-                            stopped_on_ts = True
+                        if ts < min_keep_ts:
+                            stopped = True
                             break
+                        if ts < CS2_START_TS:
+                            continue
 
                     t1_id, t2_id = parse_match_team_ids(match_html)
                     if t1_id is None or t2_id is None:
@@ -228,7 +233,7 @@ def main() -> None:
                         continue
 
                     if t1_id not in top_set or t2_id not in top_set:
-                        time.sleep(args.match_delay)
+                        time.sleep(args.match-delay if False else args.match_delay)
                         continue
 
                     writer.writerow(
@@ -248,7 +253,7 @@ def main() -> None:
                 offset += 100
                 pbar.update(1)
 
-                if stopped_on_ts:
+                if stopped:
                     break
 
                 time.sleep(args.delay)
