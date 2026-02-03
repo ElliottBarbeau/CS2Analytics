@@ -12,7 +12,7 @@ class MatchMap(Base):
 
     map_name: Mapped[str] = mapped_column(String(32), index=True)
 
-    team1_id: Mapped[int] = mapped_column(ForeignKey("teams.id", ondelete="CASCADE"), index=True)
-    team2_id: Mapped[int] = mapped_column(ForeignKey("teams.id", ondelete="CASCADE"), index=True)
+    team1_rounds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    team2_rounds: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     winner_team_id: Mapped[int | None] = mapped_column(ForeignKey("teams.id", ondelete="SET NULL"), index=True, nullable=True)

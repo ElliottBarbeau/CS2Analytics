@@ -72,6 +72,48 @@ def build_stats_urls(kind: str, stats_id: int, slug: str) -> Dict[str, str]:
     return {"base": base, "performance": perf}
 
 
+def parse_match_timestamp(match_html: str) -> Optional[int]:
+    soup = BeautifulSoup(match_html, "html.parser")
+
+    candidates = [
+        ".timeAndEvent [data-unix]",
+        ".matchInfo [data-unix]",
+        ".time [data-unix]",
+        "[data-unix]",
+    ]
+
+    for sel in candidates:
+        el = soup.select_one(sel)
+        if el and el.has_attr("data-unix"):
+            v = str(el["data-unix"]).strip()
+            if v.isdigit():
+                ts = int(v)
+                if ts > 10_000_000_000:
+                    ts = ts // 1000
+                return ts
+
+    m = re.search(r'data-unix\s*=\s*"(\d+)"', match_html)
+    if m:
+        ts = int(m.group(1))
+        if ts > 10_000_000_000:
+            ts = ts // 1000
+        return ts
+
+    return None
+
+
+def parse_team_names(match_html: str) -> Tuple[Optional[str], Optional[str]]:
+    soup = BeautifulSoup(match_html, "html.parser")
+
+    t1 = soup.select_one(".team1 .teamName, .team1 .teamName a")
+    t2 = soup.select_one(".team2 .teamName, .team2 .teamName a")
+
+    team1 = t1.get_text(" ", strip=True) if t1 else None
+    team2 = t2.get_text(" ", strip=True) if t2 else None
+
+    return team1, team2
+
+
 def parse_veto(match_html: str) -> Dict[str, Any]:
     soup = BeautifulSoup(match_html, "html.parser")
     boxes = soup.select(".veto-box")
@@ -295,6 +337,8 @@ def main() -> None:
 
             try:
                 match_html = fetch(scraper, match_url)
+                team1_name, team2_name = parse_team_names(match_html)
+                timestamp = parse_match_timestamp(match_html)
                 veto = parse_veto(match_html)
 
                 ref = extract_stats_match_ref(match_html)
@@ -313,7 +357,6 @@ def main() -> None:
                         )
                         + "\n"
                     )
-                    time.sleep(args.delay)
                     continue
 
                 kind, stats_id, slug = ref
@@ -338,6 +381,9 @@ def main() -> None:
                 fout.write(json.dumps({
                     "match_id": match_id,
                     "match_url": match_url,
+                    "team1_name": team1_name,
+                    "team2_name": team2_name,
+                    "timestamp": timestamp,
                     "veto": veto,
                     "map_results": map_results,
                     "stats_match_id": stats_id,
@@ -365,8 +411,6 @@ def main() -> None:
                     )
                     + "\n"
                 )
-
-            time.sleep(args.delay)
 
     print(f"Wrote -> {out_path}")
     print(f"blocked={blocked} failed={failed} no_stats_ref={no_stats_ref} total={len(match_urls)}")
