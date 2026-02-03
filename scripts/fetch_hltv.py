@@ -1,67 +1,64 @@
 from __future__ import annotations
 
+import argparse
 import csv
 import re
 import time
 import cloudscraper
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 from bs4 import BeautifulSoup
 
 
 BASE = "https://www.hltv.org"
-RANKING_URL = f"{BASE}/valve-ranking/teams"
 RESULTS_URL = f"{BASE}/results"
 
 TEAM_RE = re.compile(r"^/team/(\d+)/")
 MATCH_RE = re.compile(r"^/matches/(\d+)/")
 
+TOP_30 = [
+    8297,  # Furia
+    11283,  # Falcons
+    7020, # Spirit
+    4914,  # 3DMax
+    4608,  # Navi
+    13286,  # FUT
+    6665,  # Astralis
+    4494,  # Mouz
+    6667,  # Faze
+    9565,  # Vitality
+    11861,  # Aurora
+    12467, # Parivision
+    5995, # G2
+    5973, # Liquid
+    11241, # B8
+    12468, # Legacy
+    6673, # NRG
+    9928, # GamerLegion
+    4773, # Pain
+    12736, # M80
+    4411, # NIP
+    12878, # BC.Game
+    12394, # Betboom
+    7175, # Heroic
+    9215, # MIBR
+    13404, # Gentle Mates
+    11581, # Hotu
+    12426, # Passion UA
+    7532, # BIG
+    6248, # Mongolz
+]
 
-@dataclass(frozen=True)
-class Team:
-    team_id: int
-    team_name: str
-    team_url: str
 
-
-def fetch_html(url: str, scraper) -> Tuple[Optional[str], int]:
+def fetch_html(url: str, scraper) -> Optional[str]:
     r = scraper.get(url)
     return r.text
-
-
-def parse_top30_teams(html: str) -> List[Team]:
-    soup = BeautifulSoup(html, "lxml")
-
-    teams: List[Team] = []
-    seen: Set[int] = set()
-
-    for a in soup.select('a[href^="/team/"]'):
-        href = a.get("href") or ""
-        m = TEAM_RE.match(href)
-        if not m:
-            continue
-        team_id = int(m.group(1))
-        if team_id in seen:
-            continue
-
-        name = a.get_text(strip=True) or ""
-        if not name:
-            continue
-
-        seen.add(team_id)
-        teams.append(Team(team_id=team_id, team_name=name, team_url=BASE + href))
-        if len(teams) >= 30:
-            break
-
-    return teams
 
 
 def parse_match_links(html: str) -> List[Tuple[int, str]]:
     soup = BeautifulSoup(html, "lxml")
     out: List[Tuple[int, str]] = []
     seen: Set[int] = set()
-
     for a in soup.select('a[href^="/matches/"]'):
         href = a.get("href") or ""
         m = MATCH_RE.match(href)
@@ -72,41 +69,70 @@ def parse_match_links(html: str) -> List[Tuple[int, str]]:
             continue
         seen.add(match_id)
         out.append((match_id, BASE + href))
-
     return out
 
 
+def parse_match_team_ids(match_html: str) -> Tuple[Optional[int], Optional[int]]:
+    soup = BeautifulSoup(match_html, "lxml")
+    ids: List[int] = []
+    for a in soup.select('a[href^="/team/"]'):
+        href = a.get("href") or ""
+        m = TEAM_RE.match(href)
+        if not m:
+            continue
+        ids.append(int(m.group(1)))
+    if not ids:
+        m2 = re.findall(r'"/team/(\d+)/', match_html)
+        ids = [int(x) for x in m2]
+    uniq: List[int] = []
+    for tid in ids:
+        if tid not in uniq:
+            uniq.append(tid)
+        if len(uniq) >= 2:
+            break
+    if len(uniq) >= 2:
+        return uniq[0], uniq[1]
+    if len(uniq) == 1:
+        return uniq[0], None
+    return None, None
+
+
 def main() -> None:
-    out_csv = Path("data/processed/hltv_top30_match_urls.csv")
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--team", type=int, required=True)
+    ap.add_argument("--out-dir", default="data/processed")
+    ap.add_argument("--delay", type=float, default=1.2)
+    ap.add_argument("--match-delay", type=float, default=0.25)
+    args = ap.parse_args()
+
+    team_id = args.team
+    if team_id not in TOP_30:
+        raise RuntimeError("team id not in TOP_30 list")
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    out_csv = out_dir / f"hltv_matches_{team_id}.csv"
+
     scraper = cloudscraper.create_scraper()
 
-    print(f"url:  {RANKING_URL}")
-    ranking_html = fetch_html(RANKING_URL, scraper)
-    if not ranking_html:
-        print(f"failed fetching ranking")
-        return
+    top_set: Set[int] = set(TOP_30)
+    seen_matches: Set[int] = set()
 
-    teams = parse_top30_teams(ranking_html)
-    if not teams:
-        print("could not parse top 30 teams from ranking page")
-        return
+    with out_csv.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["seed_team_id", "match_id", "match_url"])
+        writer.writeheader()
 
-    all_rows: List[Dict[str, str]] = []
-    global_seen_matches: Set[int] = set()
-
-    for i, t in enumerate(teams, start=1):
-        print(f"[TEAM {i:02d}/30] {t.team_name} ({t.team_id})")
+        print(f"[TEAM] {team_id}")
         offset = 0
         pages = 0
 
         while True:
-            url = f"{RESULTS_URL}?team={t.team_id}&offset={offset}"
+            url = f"{RESULTS_URL}?team={team_id}&offset={offset}"
             print(url)
-            html = fetch_html(url, scraper)
 
+            html = fetch_html(url, scraper)
             if not html:
-                print("fetch failed for match history")
                 break
 
             links = parse_match_links(html)
@@ -114,19 +140,36 @@ def main() -> None:
                 break
 
             new_on_page = 0
+
             for match_id, match_url in links:
-                if match_id in global_seen_matches:
+                if match_id in seen_matches:
                     continue
-                global_seen_matches.add(match_id)
+
+                match_html = fetch_html(match_url, scraper)
+                seen_matches.add(match_id)
+
+                if not match_html:
+                    continue
+
+                t1_id, t2_id = parse_match_team_ids(match_html)
+                if t1_id is None or t2_id is None:
+                    continue
+
+                if t1_id not in top_set or t2_id not in top_set:
+                    continue
+
                 new_on_page += 1
-                all_rows.append(
+
+                writer.writerow(
                     {
-                        "team_id": str(t.team_id),
-                        "team_name": t.team_name,
+                        "seed_team_id": str(team_id),
                         "match_id": str(match_id),
                         "match_url": match_url,
                     }
                 )
+                f.flush()
+
+                time.sleep(args.match_delay)
 
             pages += 1
             if new_on_page == 0:
@@ -136,18 +179,9 @@ def main() -> None:
             if pages >= 50 or offset > 100:
                 break
 
-            time.sleep(1.2)
+            time.sleep(args.delay)
 
-        time.sleep(2.0)
-
-    all_rows.sort(key=lambda r: int(r["match_id"]), reverse=False)
-
-    with out_csv.open("w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["team_id", "team_name", "match_id", "match_url"])
-        w.writeheader()
-        w.writerows(all_rows)
-
-    print(f"[DONE] wrote {len(all_rows)} unique matches -> {out_csv}")
+    print(f"[DONE] wrote -> {out_csv}")
 
 
 if __name__ == "__main__":

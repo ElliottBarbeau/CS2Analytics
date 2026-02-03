@@ -6,6 +6,11 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_db
 from app.db.models.match import Match
 from app.db.models.veto_action import VetoAction
+from app.services.team_map_winrate import get_team_map_winrate
+from app.services.team_list import list_teams
+from app.services.team_summary import get_team_summary
+
+
 
 router = APIRouter(prefix="/teams", tags=["teams"])
 
@@ -84,3 +89,17 @@ def get_permaban(
         },
         "breakdown": breakdown,
     }
+
+@router.get("/{team_id}/maps/{map_name}/winrate")
+def team_map_winrate(team_id: int, map_name: str, db: Session = Depends(get_db)):
+    return get_team_map_winrate(db, team_id=team_id, map_name=map_name)
+
+@router.get("/")
+def list_all_teams(db: Session = Depends(get_db)):
+    return list_teams(db)
+
+@router.get("/{team_id}/summary")
+def team_summary(team_id: int, db: Session = Depends(get_db)):
+    return get_team_summary(db, team_id=team_id)
+
+
