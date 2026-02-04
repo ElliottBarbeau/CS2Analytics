@@ -40,7 +40,7 @@ TOP_30 = [
     6673,  # NRG
     9928,  # GamerLegion
     4773,  # Pain
-    12736,  # M80
+    12376,  # M80
     4411,  # NIP
     12878,  # BC.Game
     12394,  # Betboom
@@ -83,14 +83,32 @@ def parse_match_links(html: str) -> List[Tuple[int, str]]:
 
 def parse_match_team_ids(match_html: str) -> Tuple[Optional[int], Optional[int]]:
     soup = BeautifulSoup(match_html, "lxml")
-    ids: List[int] = []
 
+    def tid_from_sel(sel: str) -> Optional[int]:
+        a = soup.select_one(sel)
+        if not a:
+            return None
+        href = (a.get("href") or "").strip()
+        m = TEAM_RE.match(href)
+        if not m:
+            m2 = re.search(r"/team/(\d+)/", href)
+            if not m2:
+                return None
+            return int(m2.group(1))
+        return int(m.group(1))
+
+    t1 = tid_from_sel(".team1 .teamName a[href^='/team/'], .team1 a[href^='/team/']")
+    t2 = tid_from_sel(".team2 .teamName a[href^='/team/'], .team2 a[href^='/team/']")
+
+    if t1 is not None and t2 is not None:
+        return t1, t2
+
+    ids: List[int] = []
     for a in soup.select('a[href^="/team/"]'):
         href = a.get("href") or ""
         m = TEAM_RE.match(href)
-        if not m:
-            continue
-        ids.append(int(m.group(1)))
+        if m:
+            ids.append(int(m.group(1)))
 
     if not ids:
         m2 = re.findall(r'"/team/(\d+)/', match_html)
@@ -189,6 +207,8 @@ def main() -> None:
     stopped = False
     completed = False
     empty_pages_in_a_row = 0
+    no_kept_pages_in_a_row = 0
+    prev_page_match_ids: Optional[Tuple[int, ...]] = None
 
     pbar = tqdm(total=args.max_pages, desc=f"HLTV pages team={team_id}", unit="page")
 
@@ -221,6 +241,11 @@ def main() -> None:
                     continue
 
                 empty_pages_in_a_row = 0
+
+                page_match_ids = tuple(sorted(mid for mid, _ in links))
+                if prev_page_match_ids is not None and page_match_ids == prev_page_match_ids:
+                    break
+                prev_page_match_ids = page_match_ids
 
                 any_new_written_on_page = 0
                 any_new_seen_on_page = 0
@@ -282,7 +307,15 @@ def main() -> None:
                 if any_new_seen_on_page == 0:
                     break
 
-                if any_new_written_on_page == 0 and last_ts is not None:
+                if any_new_written_on_page == 0:
+                    no_kept_pages_in_a_row += 1
+                else:
+                    no_kept_pages_in_a_row = 0
+
+                if last_ts is not None and any_new_written_on_page == 0:
+                    break
+
+                if no_kept_pages_in_a_row >= 3:
                     break
 
                 time.sleep(args.delay)

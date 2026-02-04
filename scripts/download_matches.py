@@ -5,6 +5,7 @@ import csv
 import json
 import re
 import time
+from datetime import datetime
 from io import StringIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -14,9 +15,13 @@ import cloudscraper
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
+
 
 OUT_DIR_DEFAULT = "data/raw"
-
 
 MATCH_ID_RE = re.compile(r"/matches/(\d+)/", re.IGNORECASE)
 STATS_MATCH_LINK_RE = re.compile(r"^/stats/matches/(?:(mapstatsid)/)?(\d+)/(.+)$", re.IGNORECASE)
@@ -28,14 +33,98 @@ CF_MARKERS = (
     "Enable JavaScript and cookies to continue",
 )
 
+SEEDING_NEGATIVE_PATTERNS = [
+    r"\blower\s+bracket\b",
+    r"\blower-bracket\b",
+    r"\blower\s+final\b",
+    r"\blower\s+semi\b",
+    r"\blower\s+round\b",
+    r"\beliminat(?:ed|ion)\b",
+    r"\bknock(?:ed)?\s+out\b",
+    r"\bdecider\b",
+    r"\bplay\s+in\b",
+]
+
+SEEDING_POSITIVE_PATTERNS = [
+    r"\bboth\s+teams\b.*\bplay-?offs\b",
+    r"\bboth\s+teams\b.*\badvance\b",
+    r"\bboth\s+teams\b.*\bqualified\b",
+    r"\bboth\s+teams\b.*\bsecure\b.*\bplay-?offs\b",
+    r"\bwinner\b.*\bsemi[-\s]?finals?\b.*\b(loser|losing\s+team)\b.*\bquarter[-\s]?finals?\b",
+    r"\bwinner\b.*\bquarter[-\s]?finals?\b.*\b(loser|losing\s+team)\b.*\bquarter[-\s]?finals?\b",
+    r"\bwinner\b.*\bplay-?offs?\b.*\b(loser|losing\s+team)\b.*\bplay-?offs?\b",
+    r"\b(loser|losing\s+team)\b.*\bquarter[-\s]?finals?\b.*\bwinner\b.*\bsemi[-\s]?finals?\b",
+]
+
+COUNTRY_TZ = {
+    "poland": "Europe/Warsaw",
+    "germany": "Europe/Berlin",
+    "denmark": "Europe/Copenhagen",
+    "sweden": "Europe/Stockholm",
+    "norway": "Europe/Oslo",
+    "finland": "Europe/Helsinki",
+    "france": "Europe/Paris",
+    "spain": "Europe/Madrid",
+    "portugal": "Europe/Lisbon",
+    "italy": "Europe/Rome",
+    "netherlands": "Europe/Amsterdam",
+    "belgium": "Europe/Brussels",
+    "switzerland": "Europe/Zurich",
+    "austria": "Europe/Vienna",
+    "czech republic": "Europe/Prague",
+    "czechia": "Europe/Prague",
+    "slovakia": "Europe/Bratislava",
+    "hungary": "Europe/Budapest",
+    "romania": "Europe/Bucharest",
+    "bulgaria": "Europe/Sofia",
+    "serbia": "Europe/Belgrade",
+    "croatia": "Europe/Zagreb",
+    "slovenia": "Europe/Ljubljana",
+    "ukraine": "Europe/Kyiv",
+    "russia": "Europe/Moscow",
+    "turkey": "Europe/Istanbul",
+    "united kingdom": "Europe/London",
+    "uk": "Europe/London",
+    "ireland": "Europe/Dublin",
+    "united states": "America/New_York",
+    "usa": "America/New_York",
+    "canada": "America/Toronto",
+    "mexico": "America/Mexico_City",
+    "brazil": "America/Sao_Paulo",
+    "argentina": "America/Argentina/Buenos_Aires",
+    "chile": "America/Santiago",
+    "colombia": "America/Bogota",
+    "peru": "America/Lima",
+    "china": "Asia/Shanghai",
+    "hong kong": "Asia/Hong_Kong",
+    "taiwan": "Asia/Taipei",
+    "japan": "Asia/Tokyo",
+    "south korea": "Asia/Seoul",
+    "korea": "Asia/Seoul",
+    "singapore": "Asia/Singapore",
+    "malaysia": "Asia/Kuala_Lumpur",
+    "thailand": "Asia/Bangkok",
+    "vietnam": "Asia/Ho_Chi_Minh",
+    "philippines": "Asia/Manila",
+    "india": "Asia/Kolkata",
+    "united arab emirates": "Asia/Dubai",
+    "uae": "Asia/Dubai",
+    "saudi arabia": "Asia/Riyadh",
+    "qatar": "Asia/Qatar",
+    "australia": "Australia/Sydney",
+    "new zealand": "Pacific/Auckland",
+    "south africa": "Africa/Johannesburg",
+    "egypt": "Africa/Cairo",
+}
+
 
 def is_blocked(html: str) -> bool:
     h = html or ""
     return any(m in h for m in CF_MARKERS)
 
 
-def fetch(scraper: cloudscraper.CloudScraper, url: str) -> str:
-    r = scraper.get(url)
+def fetch(scraper: cloudscraper.CloudScraper, url: str, timeout: int) -> str:
+    r = scraper.get(url, timeout=timeout)
     return r.text
 
 
@@ -305,6 +394,66 @@ def read_match_urls_from_csv(path: Path, url_column: str) -> List[str]:
     return urls
 
 
+def parse_seeding_info(match_html: str) -> Tuple[bool, Optional[str]]:
+    soup = BeautifulSoup(match_html, "html.parser")
+    text = soup.get_text(" ", strip=True) or (match_html or "")
+    low = text.lower()
+
+    for pat in SEEDING_NEGATIVE_PATTERNS:
+        if re.search(pat, low, re.I):
+            return False, None
+
+    for pat in SEEDING_POSITIVE_PATTERNS:
+        m = re.search(pat, low, re.I)
+        if m:
+            start = max(0, m.start() - 160)
+            end = min(len(text), m.end() + 240)
+            snippet = re.sub(r"\s+", " ", text[start:end]).strip()
+            return True, snippet
+
+    return False, None
+
+
+def extract_event_country(match_html: str) -> Optional[str]:
+    soup = BeautifulSoup(match_html, "html.parser")
+    flag = soup.select_one(".timeAndEvent .event .flag, .event .flag, .event-holder .flag, .matchInfo .flag")
+    if flag:
+        for k in ("title", "alt"):
+            v = flag.get(k)
+            if v:
+                v2 = re.sub(r"\s+", " ", str(v)).strip()
+                if v2:
+                    return v2
+
+    m = re.search(r'class="flag[^"]*"\s+title="([^"]+)"', match_html or "", re.I)
+    if m:
+        v2 = re.sub(r"\s+", " ", m.group(1)).strip()
+        return v2 or None
+
+    return None
+
+
+def resolve_timezone_name(country: Optional[str]) -> str:
+    if not country:
+        return "UTC"
+    key = re.sub(r"\s+", " ", country.strip().lower())
+    return COUNTRY_TZ.get(key, "UTC")
+
+
+def weekday_in_event_tz(ts: Optional[int], tz_name: str) -> Optional[str]:
+    if ts is None:
+        return None
+    if ZoneInfo is None:
+        return datetime.utcfromtimestamp(ts).strftime("%A")
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("UTC")
+        tz_name = "UTC"
+    dt = datetime.fromtimestamp(ts, tz=tz)
+    return dt.strftime("%A")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--team", type=int, required=True)
@@ -317,9 +466,7 @@ def main() -> None:
 
     csv_path = Path(f"data/processed/hltv_matches_{args.team}.csv")
     out_dir = Path(args.out_dir)
-
     out_dir.mkdir(parents=True, exist_ok=True)
-
     out_path = out_dir / f"hltv_match_veto_and_stats_{args.team}.jsonl"
 
     scraper = cloudscraper.create_scraper()
@@ -340,9 +487,19 @@ def main() -> None:
                 continue
 
             try:
-                match_html = fetch(scraper, match_url)
+                match_html = fetch(scraper, match_url, args.timeout)
+                if is_blocked(match_html):
+                    blocked += 1
+
                 team1_name, team2_name = parse_team_names(match_html)
                 timestamp = parse_match_timestamp(match_html)
+
+                country = extract_event_country(match_html)
+                tz_name = resolve_timezone_name(country)
+                weekday = weekday_in_event_tz(timestamp, tz_name)
+
+                is_seeding, seeding_note = parse_seeding_info(match_html)
+
                 veto = parse_veto(match_html)
 
                 ref = extract_stats_match_ref(match_html)
@@ -353,6 +510,14 @@ def main() -> None:
                             {
                                 "match_id": match_id,
                                 "match_url": match_url,
+                                "team1_name": team1_name,
+                                "team2_name": team2_name,
+                                "timestamp": timestamp,
+                                "event_country": country,
+                                "event_timezone": tz_name,
+                                "weekday_local": weekday,
+                                "is_seeding_match": is_seeding,
+                                "seeding_note": seeding_note,
                                 "veto": veto,
                                 "error": "NO_STATS_MATCH_REF",
                             },
@@ -361,14 +526,13 @@ def main() -> None:
                         + "\n"
                     )
                     written += 1
-                    print("NO STATS MATCH REF")
                     time.sleep(args.delay)
                     continue
 
                 kind, stats_id, slug = ref
                 stats_urls = build_stats_urls(kind, stats_id, slug)
 
-                base_html = fetch(scraper, stats_urls["base"])
+                base_html = fetch(scraper, stats_urls["base"], args.timeout)
                 base_tables = parse_all_tables(base_html)
                 map_results = parse_map_results(match_html)
 
@@ -380,6 +544,11 @@ def main() -> None:
                             "team1_name": team1_name,
                             "team2_name": team2_name,
                             "timestamp": timestamp,
+                            "event_country": country,
+                            "event_timezone": tz_name,
+                            "weekday_local": weekday,
+                            "is_seeding_match": is_seeding,
+                            "seeding_note": seeding_note,
                             "veto": veto,
                             "map_results": map_results,
                             "stats_match_id": stats_id,
