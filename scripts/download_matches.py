@@ -33,6 +33,17 @@ CF_MARKERS = (
     "Enable JavaScript and cookies to continue",
 )
 
+THIRD_PLACE_PATTERNS = [
+    r"\b3rd\s*place\b",
+    r"\bthird\s*place\b",
+    r"\b3rd\s*place\s*decider\b",
+    r"\bthird\s*place\s*decider\b",
+    r"\bbronze\s*match\b",
+    r"\bbronze\s*final\b",
+    r"\bmatch\s*for\s*third\b",
+    r"\bplayoff\s*for\s*third\b",
+]
+
 SEEDING_NEGATIVE_PATTERNS = [
     r"\blower\s+bracket\b",
     r"\blower-bracket\b",
@@ -116,6 +127,26 @@ COUNTRY_TZ = {
     "south africa": "Africa/Johannesburg",
     "egypt": "Africa/Cairo",
 }
+
+NO_STATS_FATAL = False
+
+NO_STATS_KEYWORDS = [
+    "forfeit",
+    "walkover",
+    "default win",
+    "technical win",
+    "match was not played",
+    "not played",
+    "awarded",
+    "won by default",
+    "team withdrew",
+    "withdrew",
+    "withdrawn",
+    "disqualified",
+    "dq",
+    "cancelled",
+    "canceled",
+]
 
 
 def is_blocked(html: str) -> bool:
@@ -260,8 +291,7 @@ def parse_map_results(match_html: str) -> List[Dict[str, Any]]:
     team1 = t1.get_text(" ", strip=True) if t1 else None
     team2 = t2.get_text(" ", strip=True) if t2 else None
 
-    out = []
-
+    out: List[Dict[str, Any]] = []
     holders = soup.select(".mapholder") or soup.select(".mapholder.small")
 
     for h in holders:
@@ -414,6 +444,54 @@ def parse_seeding_info(match_html: str) -> Tuple[bool, Optional[str]]:
     return False, None
 
 
+def _find_maps_box_text(match_html: str) -> Optional[str]:
+    """
+    Only inspect the 'Maps' box (where HLTV shows '+ 3rd place decider match').
+    """
+    soup = BeautifulSoup(match_html, "html.parser")
+
+    for box in soup.select(".standard-box"):
+        headline = box.select_one(".standard-box-headline")
+        if headline and (headline.get_text(" ", strip=True) or "").strip().lower() == "maps":
+            return box.get_text("\n", strip=True) or None
+
+    h = soup.find(
+        lambda tag: tag.name in ("h1", "h2", "h3", "h4")
+        and (tag.get_text(" ", strip=True) or "").strip().lower() == "maps"
+    )
+    if h:
+        parent = h.parent
+        if parent:
+            return parent.get_text("\n", strip=True) or None
+
+    return None
+
+
+def parse_third_place_decider(match_html: str) -> Tuple[bool, Optional[str]]:
+    maps_text = _find_maps_box_text(match_html)
+    if maps_text:
+        low = maps_text.lower()
+        for pat in THIRD_PLACE_PATTERNS:
+            m = re.search(pat, low, re.I)
+            if m:
+                start = max(0, m.start() - 140)
+                end = min(len(maps_text), m.end() + 220)
+                snippet = re.sub(r"\s+", " ", maps_text[start:end]).strip()
+                return True, snippet
+
+    soup = BeautifulSoup(match_html, "html.parser")
+    veto_box = soup.select_one(".veto-box")
+    if veto_box:
+        veto_text = veto_box.get_text(" ", strip=True) or ""
+        low2 = veto_text.lower()
+        for pat in THIRD_PLACE_PATTERNS:
+            m = re.search(pat, low2, re.I)
+            if m:
+                return True, veto_text
+
+    return False, None
+
+
 def extract_event_country(match_html: str) -> Optional[str]:
     soup = BeautifulSoup(match_html, "html.parser")
     flag = soup.select_one(".timeAndEvent .event .flag, .event .flag, .event-holder .flag, .matchInfo .flag")
@@ -454,6 +532,34 @@ def weekday_in_event_tz(ts: Optional[int], tz_name: str) -> Optional[str]:
     return dt.strftime("%A")
 
 
+def looks_like_no_stats_match(match_html: str) -> Tuple[bool, Optional[str]]:
+    """
+    Detect matches that won't have HLTV stats: forfeit/WO/DQ/cancelled/not played.
+    Returns (True, note/snippet) if it looks like a no-stats match.
+    """
+    soup = BeautifulSoup(match_html, "html.parser")
+    text = soup.get_text(" ", strip=True) or ""
+    low = text.lower()
+
+    if re.search(r"\b(w\/o|wo)\b", low):
+        return True, "WO"
+
+    for kw in NO_STATS_KEYWORDS:
+        if kw == "dq":
+            if re.search(r"\bdq\b", low):
+                return True, "DQ"
+            continue
+
+        idx = low.find(kw)
+        if idx != -1:
+            start = max(0, idx - 120)
+            end = min(len(text), idx + 240)
+            snippet = re.sub(r"\s+", " ", text[start:end]).strip()
+            return True, snippet
+
+    return False, None
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--team", type=int, required=True)
@@ -478,6 +584,7 @@ def main() -> None:
     blocked = 0
     failed = 0
     no_stats_ref = 0
+    no_stats_skipped = 0
     written = 0
 
     with out_path.open("w", encoding="utf-8") as fout:
@@ -488,6 +595,8 @@ def main() -> None:
 
             try:
                 match_html = fetch(scraper, match_url, args.timeout)
+                print(match_url)
+
                 if is_blocked(match_html):
                     blocked += 1
 
@@ -499,12 +608,46 @@ def main() -> None:
                 weekday = weekday_in_event_tz(timestamp, tz_name)
 
                 is_seeding, seeding_note = parse_seeding_info(match_html)
-
+                is_third_place, third_place_note = parse_third_place_decider(match_html)
                 veto = parse_veto(match_html)
 
                 ref = extract_stats_match_ref(match_html)
                 if not ref:
                     no_stats_ref += 1
+
+                    is_no_stats, no_stats_note = looks_like_no_stats_match(match_html)
+                    if is_no_stats:
+                        no_stats_skipped += 1
+                        fout.write(
+                            json.dumps(
+                                {
+                                    "match_id": match_id,
+                                    "match_url": match_url,
+                                    "team1_name": team1_name,
+                                    "team2_name": team2_name,
+                                    "timestamp": timestamp,
+                                    "event_country": country,
+                                    "event_timezone": tz_name,
+                                    "weekday_local": weekday,
+                                    "is_seeding_match": is_seeding,
+                                    "seeding_note": seeding_note,
+                                    "is_third_place_decider": is_third_place,
+                                    "third_place_note": third_place_note,
+                                    "veto": veto,
+                                    "error": "NO_STATS_FORFEIT_OR_CANCELLED",
+                                    "no_stats_note": no_stats_note,
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
+                        written += 1
+                        time.sleep(args.delay)
+                        continue
+
+                    if NO_STATS_FATAL:
+                        raise RuntimeError("NO_STATS_MATCH_REF")
+
                     fout.write(
                         json.dumps(
                             {
@@ -518,8 +661,10 @@ def main() -> None:
                                 "weekday_local": weekday,
                                 "is_seeding_match": is_seeding,
                                 "seeding_note": seeding_note,
+                                "is_third_place_decider": is_third_place,
+                                "third_place_note": third_place_note,
                                 "veto": veto,
-                                "error": "NO_STATS_MATCH_REF",
+                                "error": "NO_STATS_MATCH_REF_SKIPPED",
                             },
                             ensure_ascii=False,
                         )
@@ -549,6 +694,8 @@ def main() -> None:
                             "weekday_local": weekday,
                             "is_seeding_match": is_seeding,
                             "seeding_note": seeding_note,
+                            "is_third_place_decider": is_third_place,
+                            "third_place_note": third_place_note,
                             "veto": veto,
                             "map_results": map_results,
                             "stats_match_id": stats_id,
@@ -560,11 +707,14 @@ def main() -> None:
                     )
                     + "\n"
                 )
-
                 written += 1
 
             except Exception as e:
                 msg = f"{type(e).__name__}: {e}"
+
+                if "NO_STATS_MATCH_REF" in msg:
+                    raise SystemExit(2)
+
                 if "BLOCKED" in msg:
                     blocked += 1
                 else:
@@ -581,14 +731,14 @@ def main() -> None:
                     )
                     + "\n"
                 )
-
                 written += 1
 
             time.sleep(args.delay)
 
     print(f"Wrote -> {out_path}")
     print(
-        f"team={args.team} written={written} blocked={blocked} failed={failed} no_stats_ref={no_stats_ref} total={len(match_urls)}"
+        f"team={args.team} written={written} blocked={blocked} failed={failed} "
+        f"no_stats_ref={no_stats_ref} no_stats_skipped={no_stats_skipped} total={len(match_urls)}"
     )
 
 
