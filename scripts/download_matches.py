@@ -33,6 +33,9 @@ CF_MARKERS = (
     "Enable JavaScript and cookies to continue",
 )
 
+DASH_CHARS_RE = re.compile(r"[\u2010\u2011\u2012\u2013\u2014\u2212]")
+NBSP_RE = re.compile(r"[\u00A0\u202F]")
+
 THIRD_PLACE_PATTERNS = [
     r"\b3rd\s*place\b",
     r"\bthird\s*place\b",
@@ -42,29 +45,6 @@ THIRD_PLACE_PATTERNS = [
     r"\bbronze\s*final\b",
     r"\bmatch\s*for\s*third\b",
     r"\bplayoff\s*for\s*third\b",
-]
-
-SEEDING_NEGATIVE_PATTERNS = [
-    r"\blower\s+bracket\b",
-    r"\blower-bracket\b",
-    r"\blower\s+final\b",
-    r"\blower\s+semi\b",
-    r"\blower\s+round\b",
-    r"\beliminat(?:ed|ion)\b",
-    r"\bknock(?:ed)?\s+out\b",
-    r"\bdecider\b",
-    r"\bplay\s+in\b",
-]
-
-SEEDING_POSITIVE_PATTERNS = [
-    r"\bboth\s+teams\b.*\bplay-?offs\b",
-    r"\bboth\s+teams\b.*\badvance\b",
-    r"\bboth\s+teams\b.*\bqualified\b",
-    r"\bboth\s+teams\b.*\bsecure\b.*\bplay-?offs\b",
-    r"\bwinner\b.*\bsemi[-\s]?finals?\b.*\b(loser|losing\s+team)\b.*\bquarter[-\s]?finals?\b",
-    r"\bwinner\b.*\bquarter[-\s]?finals?\b.*\b(loser|losing\s+team)\b.*\bquarter[-\s]?finals?\b",
-    r"\bwinner\b.*\bplay-?offs?\b.*\b(loser|losing\s+team)\b.*\bplay-?offs?\b",
-    r"\b(loser|losing\s+team)\b.*\bquarter[-\s]?finals?\b.*\bwinner\b.*\bsemi[-\s]?finals?\b",
 ]
 
 COUNTRY_TZ = {
@@ -149,6 +129,23 @@ NO_STATS_KEYWORDS = [
 ]
 
 
+SEEDING_VERB_RE = re.compile(
+    r"\b(advance(?:s|d)?|proceed(?:s|ed)?|qualif(?:y|ies|ied)|go(?:es)?|progress(?:es|ed)?|secure(?:s|d)?|book(?:s|ed)?)\b",
+    re.I,
+)
+SEMI_RE = re.compile(r"\b(playoff\s*)?semi(?:-|\s)?finals?\b", re.I)
+QUARTER_RE = re.compile(r"\b(playoff\s*)?quarter(?:-|\s)?finals?\b", re.I)
+WINNER_RE = re.compile(r"\bwinner\b", re.I)
+LOSER_RE = re.compile(r"\b(loser|losing\s+team)\b", re.I)
+
+
+def _norm(s: str) -> str:
+    s = NBSP_RE.sub(" ", s or "")
+    s = DASH_CHARS_RE.sub("-", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+
 def is_blocked(html: str) -> bool:
     h = html or ""
     return any(m in h for m in CF_MARKERS)
@@ -195,14 +192,12 @@ def build_stats_urls(kind: str, stats_id: int, slug: str) -> Dict[str, str]:
 def parse_match_timestamp(match_html: str) -> Optional[int]:
     soup = BeautifulSoup(match_html, "html.parser")
 
-    candidates = [
+    for sel in (
         ".timeAndEvent [data-unix]",
         ".matchInfo [data-unix]",
         ".time [data-unix]",
         "[data-unix]",
-    ]
-
-    for sel in candidates:
+    ):
         el = soup.select_one(sel)
         if el and el.has_attr("data-unix"):
             v = str(el["data-unix"]).strip()
@@ -224,13 +219,10 @@ def parse_match_timestamp(match_html: str) -> Optional[int]:
 
 def parse_team_names(match_html: str) -> Tuple[Optional[str], Optional[str]]:
     soup = BeautifulSoup(match_html, "html.parser")
-
     t1 = soup.select_one(".team1 .teamName, .team1 .teamName a")
     t2 = soup.select_one(".team2 .teamName, .team2 .teamName a")
-
     team1 = t1.get_text(" ", strip=True) if t1 else None
     team2 = t2.get_text(" ", strip=True) if t2 else None
-
     return team1, team2
 
 
@@ -262,14 +254,7 @@ def parse_veto(match_html: str) -> Dict[str, Any]:
 
         m = re.match(r"^(?P<team>.+?)\s+(?P<action>removed|banned|picked)\s+(?P<map>.+?)$", ln2, re.I)
         if m:
-            actions.append(
-                {
-                    "team": m.group("team"),
-                    "action": m.group("action").lower(),
-                    "map": m.group("map"),
-                    "raw": ln,
-                }
-            )
+            actions.append({"team": m.group("team"), "action": m.group("action").lower(), "map": m.group("map"), "raw": ln})
             continue
 
         m2 = re.match(r"^(?P<map>.+?)\s+was\s+left\s+over$", ln2, re.I)
@@ -309,14 +294,7 @@ def parse_map_results(match_html: str) -> List[Dict[str, Any]]:
             elif s2 > s1:
                 winner = team2
 
-        out.append(
-            {
-                "map": map_name,
-                "team1_rounds": s1,
-                "team2_rounds": s2,
-                "winner": winner,
-            }
-        )
+        out.append({"map": map_name, "team1_rounds": s1, "team2_rounds": s2, "winner": winner})
 
     return out
 
@@ -350,14 +328,7 @@ def parse_all_tables(html: str) -> List[Dict[str, Any]]:
 
         if df is not None:
             df.columns = normalize_columns(list(df.columns))
-            out.append(
-                {
-                    "table_index": idx,
-                    "caption": caption,
-                    "columns": list(df.columns),
-                    "rows": df.fillna("").to_dict(orient="records"),
-                }
-            )
+            out.append({"table_index": idx, "caption": caption, "columns": list(df.columns), "rows": df.fillna("").to_dict(orient="records")})
             continue
 
         rows = table.find_all("tr")
@@ -365,6 +336,7 @@ def parse_all_tables(html: str) -> List[Dict[str, Any]]:
             continue
 
         header_cells = None
+        header_tr = None
         for tr in rows[:3]:
             ths = tr.find_all("th")
             if ths:
@@ -381,7 +353,7 @@ def parse_all_tables(html: str) -> List[Dict[str, Any]]:
 
         data_rows = []
         for tr in rows:
-            if tr == header_tr:
+            if header_tr is not None and tr == header_tr:
                 continue
             cells = tr.find_all(["td", "th"])
             if not cells:
@@ -399,14 +371,7 @@ def parse_all_tables(html: str) -> List[Dict[str, Any]]:
         if not columns or not data_rows:
             continue
 
-        out.append(
-            {
-                "table_index": idx,
-                "caption": caption,
-                "columns": columns,
-                "rows": data_rows,
-            }
-        )
+        out.append({"table_index": idx, "caption": caption, "columns": columns, "rows": data_rows})
 
     return out
 
@@ -424,30 +389,7 @@ def read_match_urls_from_csv(path: Path, url_column: str) -> List[str]:
     return urls
 
 
-def parse_seeding_info(match_html: str) -> Tuple[bool, Optional[str]]:
-    soup = BeautifulSoup(match_html, "html.parser")
-    text = soup.get_text(" ", strip=True) or (match_html or "")
-    low = text.lower()
-
-    for pat in SEEDING_NEGATIVE_PATTERNS:
-        if re.search(pat, low, re.I):
-            return False, None
-
-    for pat in SEEDING_POSITIVE_PATTERNS:
-        m = re.search(pat, low, re.I)
-        if m:
-            start = max(0, m.start() - 160)
-            end = min(len(text), m.end() + 240)
-            snippet = re.sub(r"\s+", " ", text[start:end]).strip()
-            return True, snippet
-
-    return False, None
-
-
 def _find_maps_box_text(match_html: str) -> Optional[str]:
-    """
-    Only inspect the 'Maps' box (where HLTV shows '+ 3rd place decider match').
-    """
     soup = BeautifulSoup(match_html, "html.parser")
 
     for box in soup.select(".standard-box"):
@@ -455,14 +397,9 @@ def _find_maps_box_text(match_html: str) -> Optional[str]:
         if headline and (headline.get_text(" ", strip=True) or "").strip().lower() == "maps":
             return box.get_text("\n", strip=True) or None
 
-    h = soup.find(
-        lambda tag: tag.name in ("h1", "h2", "h3", "h4")
-        and (tag.get_text(" ", strip=True) or "").strip().lower() == "maps"
-    )
-    if h:
-        parent = h.parent
-        if parent:
-            return parent.get_text("\n", strip=True) or None
+    h = soup.find(lambda tag: tag.name in ("h1", "h2", "h3", "h4") and (tag.get_text(" ", strip=True) or "").strip().lower() == "maps")
+    if h and h.parent:
+        return h.parent.get_text("\n", strip=True) or None
 
     return None
 
@@ -485,8 +422,7 @@ def parse_third_place_decider(match_html: str) -> Tuple[bool, Optional[str]]:
         veto_text = veto_box.get_text(" ", strip=True) or ""
         low2 = veto_text.lower()
         for pat in THIRD_PLACE_PATTERNS:
-            m = re.search(pat, low2, re.I)
-            if m:
+            if re.search(pat, low2, re.I):
                 return True, veto_text
 
     return False, None
@@ -527,16 +463,11 @@ def weekday_in_event_tz(ts: Optional[int], tz_name: str) -> Optional[str]:
         tz = ZoneInfo(tz_name)
     except Exception:
         tz = ZoneInfo("UTC")
-        tz_name = "UTC"
     dt = datetime.fromtimestamp(ts, tz=tz)
     return dt.strftime("%A")
 
 
 def looks_like_no_stats_match(match_html: str) -> Tuple[bool, Optional[str]]:
-    """
-    Detect matches that won't have HLTV stats: forfeit/WO/DQ/cancelled/not played.
-    Returns (True, note/snippet) if it looks like a no-stats match.
-    """
     soup = BeautifulSoup(match_html, "html.parser")
     text = soup.get_text(" ", strip=True) or ""
     low = text.lower()
@@ -556,6 +487,104 @@ def looks_like_no_stats_match(match_html: str) -> Tuple[bool, Optional[str]]:
             end = min(len(text), idx + 240)
             snippet = re.sub(r"\s+", " ", text[start:end]).strip()
             return True, snippet
+
+    return False, None
+
+
+def _collect_seeding_text_candidates(match_html: str) -> List[str]:
+    soup = BeautifulSoup(match_html, "html.parser")
+    cands: List[str] = []
+
+    maps_text = _find_maps_box_text(match_html)
+    if maps_text:
+        cands.append(maps_text)
+
+    for sel in (
+        ".matchInfo",
+        ".matchInfoBox",
+        ".matchInfoBoxCon",
+        ".match-info",
+        ".match-info-box",
+        ".match-info-box-con",
+        ".timeAndEvent",
+    ):
+        for el in soup.select(sel):
+            t = el.get_text(" ", strip=True)
+            t = _norm(t)
+            if t:
+                cands.append(t)
+
+    all_text = _norm(soup.get_text(" ", strip=True) or "")
+    if all_text:
+        cands.append(all_text)
+
+    seen = set()
+    out = []
+    for t in cands:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def _find_seeding_snippet(text: str) -> Optional[str]:
+    t = _norm(text)
+    if not t:
+        return None
+
+    low = t.lower()
+    if not (WINNER_RE.search(low) and LOSER_RE.search(low) and SEMI_RE.search(low) and QUARTER_RE.search(low) and SEEDING_VERB_RE.search(low)):
+        return None
+
+    wpos = [m.start() for m in WINNER_RE.finditer(low)]
+    lpos = [m.start() for m in LOSER_RE.finditer(low)]
+    spos = [m.start() for m in SEMI_RE.finditer(low)]
+    qpos = [m.start() for m in QUARTER_RE.finditer(low)]
+    vpos = [m.start() for m in SEEDING_VERB_RE.finditer(low)]
+
+    best = None
+    best_span = None
+
+    for w in wpos:
+        for l in lpos:
+            for s in spos:
+                for q in qpos:
+                    for v in vpos:
+                        lo = min(w, l, s, q, v)
+                        hi = max(w, l, s, q, v)
+                        span = hi - lo
+                        if span <= 700:
+                            if best_span is None or span < best_span:
+                                best_span = span
+                                best = (lo, hi)
+
+    if best is None:
+        return None
+
+    lo, hi = best
+    start = max(0, lo - 200)
+    end = min(len(t), hi + 260)
+    return _norm(t[start:end])
+
+
+def parse_seeding_info(match_html: str) -> Tuple[bool, Optional[str]]:
+    for cand in _collect_seeding_text_candidates(match_html):
+        snip = _find_seeding_snippet(cand)
+        if snip:
+            return True, snip
+
+    html = match_html or ""
+    for m in re.finditer(r"winner.{0,900}semi.{0,900}(loser|losing team).{0,900}quarter", html, re.I | re.S):
+        chunk = re.sub(r"<[^>]+>", " ", html[m.start() : m.end()])
+        chunk = _norm(chunk)
+        if chunk and WINNER_RE.search(chunk) and LOSER_RE.search(chunk) and SEMI_RE.search(chunk) and QUARTER_RE.search(chunk) and SEEDING_VERB_RE.search(chunk):
+            return True, chunk[:900]
+
+    for m in re.finditer(r"(loser|losing team).{0,900}quarter.{0,900}winner.{0,900}semi", html, re.I | re.S):
+        chunk = re.sub(r"<[^>]+>", " ", html[m.start() : m.end()])
+        chunk = _norm(chunk)
+        if chunk and WINNER_RE.search(chunk) and LOSER_RE.search(chunk) and SEMI_RE.search(chunk) and QUARTER_RE.search(chunk) and SEEDING_VERB_RE.search(chunk):
+            return True, chunk[:900]
 
     return False, None
 
@@ -587,15 +616,33 @@ def main() -> None:
     no_stats_skipped = 0
     written = 0
 
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    first_url_hard_fail = False
+    if match_urls:
+        try:
+            first_html = fetch(scraper, match_urls[0], args.timeout)
+            ref0 = extract_stats_match_ref(first_html)
+            if ref0 is None and is_blocked(first_html):
+                first_url_hard_fail = True
+            elif ref0 is None and not is_blocked(first_html):
+                is_no_stats0, _ = looks_like_no_stats_match(first_html)
+                if not is_no_stats0:
+                    first_url_hard_fail = True
+        except Exception:
+            first_url_hard_fail = True
+
+    if first_url_hard_fail:
+        raise SystemExit(3)
+
     with out_path.open("w", encoding="utf-8") as fout:
-        for match_url in tqdm(match_urls, desc=f"Fetching HLTV team={args.team}"):
+        for idx, match_url in enumerate(tqdm(match_urls, desc=f"Fetching HLTV team={args.team}")):
             match_id = extract_match_id(match_url)
             if match_id is None:
                 continue
 
             try:
                 match_html = fetch(scraper, match_url, args.timeout)
-                print(match_url)
 
                 if is_blocked(match_html):
                     blocked += 1
@@ -616,6 +663,10 @@ def main() -> None:
                     no_stats_ref += 1
 
                     is_no_stats, no_stats_note = looks_like_no_stats_match(match_html)
+
+                    if idx == 0 and (is_blocked(match_html) or not is_no_stats):
+                        raise SystemExit(3)
+
                     if is_no_stats:
                         no_stats_skipped += 1
                         fout.write(
@@ -709,6 +760,8 @@ def main() -> None:
                 )
                 written += 1
 
+            except SystemExit:
+                raise
             except Exception as e:
                 msg = f"{type(e).__name__}: {e}"
 
@@ -720,17 +773,7 @@ def main() -> None:
                 else:
                     failed += 1
 
-                fout.write(
-                    json.dumps(
-                        {
-                            "match_id": match_id,
-                            "match_url": match_url,
-                            "error": msg,
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
+                fout.write(json.dumps({"match_id": match_id, "match_url": match_url, "error": msg}, ensure_ascii=False) + "\n")
                 written += 1
 
             time.sleep(args.delay)
