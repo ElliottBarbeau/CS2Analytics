@@ -1,5 +1,8 @@
-from fastapi import APIRouter, Depends
-from sqlalchemy import func, select, case
+import time
+from typing import Dict, List
+
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
@@ -12,14 +15,18 @@ router = APIRouter(prefix="/teams", tags=["teams"])
 def team_map_stats(
     team_id: int,
     map_name: str,
-    windows: str = "30",
+    windows: str = Query(default="365,90,30"),
     db: Session = Depends(get_db),
-):
-    now = int(__import__("time").time())
-    map_l = map_name.lower()
-    window_days = [int(w) for w in windows.split(",") if w.strip()]
+) -> Dict:
+    now = int(time.time())
+    window_days: List[int] = []
+    for w in windows.split(","):
+        w = w.strip()
+        if not w:
+            continue
+        window_days.append(int(w))
 
-    results = {}
+    out = {"team_id": team_id, "map": map_name, "windows": {}}
 
     for days in window_days:
         cutoff = now - days * 24 * 60 * 60
@@ -27,29 +34,21 @@ def team_map_stats(
         row = db.execute(
             select(
                 func.count().label("played"),
-                func.sum(
-                    case(
-                        (MatchMap.winner_team_id == team_id, 1),
-                        else_=0,
-                    )
-                ).label("wins"),
+                func.sum(case((MatchMap.winner_team_id == team_id, 1), else_=0)).label("wins"),
             )
             .select_from(MatchMap)
             .join(Match, Match.id == MatchMap.match_id)
             .where(
                 Match.played_at >= cutoff,
-                func.lower(MatchMap.map_name) == map_l,
                 (Match.team1_id == team_id) | (Match.team2_id == team_id),
+                func.lower(MatchMap.map_name) == func.lower(map_name),
             )
-        ).one()
+        ).first()
 
         played = int(row.played or 0)
         wins = int(row.wins or 0)
+        winrate = (wins / played) if played else None
 
-        results[str(days)] = {
-            "played": played,
-            "wins": wins,
-            "winrate": (wins / played) if played else None,
-        }
+        out["windows"][str(days)] = {"played": played, "wins": wins, "winrate": winrate}
 
-    return {"team_id": team_id, "map": map_name, "windows": results}
+    return out

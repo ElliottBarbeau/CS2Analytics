@@ -15,7 +15,7 @@ def get_team_summary(db: Session, team_id: int, now_ts: Optional[int] = None) ->
 
     permaban_row = db.execute(
         select(
-            func.lower(VetoAction.map_name).label("map_name"),
+            VetoAction.map_name.label("map_name"),
             func.count().label("ban_count"),
         )
         .join(Match, Match.id == VetoAction.match_id)
@@ -25,8 +25,8 @@ def get_team_summary(db: Session, team_id: int, now_ts: Optional[int] = None) ->
             VetoAction.action == "removed",
             VetoAction.map_name.is_not(None),
         )
-        .group_by(func.lower(VetoAction.map_name))
-        .order_by(func.count().desc(), func.lower(VetoAction.map_name).asc())
+        .group_by(VetoAction.map_name)
+        .order_by(func.count().desc(), VetoAction.map_name.asc())
         .limit(1)
     ).first()
 
@@ -34,13 +34,11 @@ def get_team_summary(db: Session, team_id: int, now_ts: Optional[int] = None) ->
     if permaban_row:
         permaban = {"map": permaban_row.map_name, "ban_count": int(permaban_row.ban_count)}
 
-    win_case = case((MatchMap.winner_team_id == team_id, 1), else_=0)
-
     map_rows = db.execute(
         select(
-            func.lower(MatchMap.map_name).label("map_name"),
+            MatchMap.map_name.label("map_name"),
             func.count().label("played"),
-            func.coalesce(func.sum(win_case), 0).label("wins"),
+            func.sum(case((MatchMap.winner_team_id == team_id, 1), else_=0)).label("wins"),
         )
         .join(Match, Match.id == MatchMap.match_id)
         .where(
@@ -48,7 +46,7 @@ def get_team_summary(db: Session, team_id: int, now_ts: Optional[int] = None) ->
             MatchMap.map_name.is_not(None),
             (Match.team1_id == team_id) | (Match.team2_id == team_id),
         )
-        .group_by(func.lower(MatchMap.map_name))
+        .group_by(MatchMap.map_name)
     ).all()
 
     maps = []
@@ -72,5 +70,5 @@ def get_team_summary(db: Session, team_id: int, now_ts: Optional[int] = None) ->
         "permaban": permaban,
         "strongest_map": strongest,
         "weakest_map": weakest,
-        "maps": sorted(maps, key=lambda x: x["map"]),
+        "maps": sorted(maps, key=lambda x: (x["map"] or "").lower()),
     }
