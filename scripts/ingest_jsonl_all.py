@@ -2,21 +2,22 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from sqlalchemy import create_engine, delete, select
+from sqlalchemy import create_engine, delete, func, inspect as sa_inspect, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.core.config import get_env
+from app.db.base import Base
 from app.db.models.match import Match
 from app.db.models.match_map import MatchMap
+from app.db.models.match_stats import MatchStatsPage, PlayerMapStat
 from app.db.models.player import Player
 from app.db.models.team import Team
 from app.db.models.veto_action import VetoAction
-from app.db.models.match_stats import MatchStatsPage, PlayerMapStat
 
 
 KHS_RE = re.compile(r"^\s*(\d+)\s*\(\s*(\d+)\s*\)\s*$")
@@ -63,7 +64,7 @@ def _parse_pct_to_float(s: Any) -> Optional[float]:
     if isinstance(s, (int, float)):
         return float(s)
     if isinstance(s, str):
-        m = PCT_RE.match(s)
+        m = PCT_RE.match(s.strip())
         if not m:
             return None
         return float(m.group(1)) / 100.0
@@ -123,26 +124,32 @@ def _iter_jsonl(paths: List[Path]) -> Iterable[Tuple[Path, int, Dict[str, Any]]]
                     yield p, i, obj
 
 
-def _ensure_team(db: Session, name: str) -> int:
-    stmt = (
-        pg_insert(Team)
-        .values(name=name)
-        .on_conflict_do_update(index_elements=[Team.name], set_={"name": name})
-        .returning(Team.id)
-    )
-    tid = db.execute(stmt).scalar_one()
-    return int(tid)
+def _get_or_create_team(db: Session, name: str) -> int:
+    nm = name.strip()
+    existing = db.scalar(select(Team).where(func.lower(Team.name) == nm.lower()))
+    if existing:
+        if existing.name != nm:
+            existing.name = nm
+            db.flush()
+        return int(existing.id)
+    t = Team(name=nm)
+    db.add(t)
+    db.flush()
+    return int(t.id)
 
 
-def _ensure_player(db: Session, name: str) -> int:
-    stmt = (
-        pg_insert(Player)
-        .values(name=name)
-        .on_conflict_do_update(index_elements=[Player.name], set_={"name": name})
-        .returning(Player.id)
-    )
-    pid = db.execute(stmt).scalar_one()
-    return int(pid)
+def _get_or_create_player(db: Session, name: str) -> int:
+    nm = name.strip()
+    existing = db.scalar(select(Player).where(func.lower(Player.name) == nm.lower()))
+    if existing:
+        if existing.name != nm:
+            existing.name = nm
+            db.flush()
+        return int(existing.id)
+    p = Player(name=nm)
+    db.add(p)
+    db.flush()
+    return int(p.id)
 
 
 def _upsert_match(
@@ -189,6 +196,8 @@ def _upsert_match(
 
 
 def _replace_veto_actions(db: Session, match_id: int, actions: List[Dict[str, Any]], team_name_to_id: Dict[str, int]) -> None:
+    db.execute(delete(VetoAction).where(VetoAction.match_id == match_id))
+
     if not actions:
         return
 
@@ -203,28 +212,17 @@ def _replace_veto_actions(db: Session, match_id: int, actions: List[Dict[str, An
         if isinstance(tname, str):
             team_id = team_name_to_id.get(_lower(tname) or "")
         rows.append(
-            {
-                "match_id": match_id,
-                "order_index": idx,
-                "team_id": team_id,
-                "action": str(action),
-                "map_name": str(map_name),
-            }
+            VetoAction(
+                match_id=match_id,
+                order_index=idx,
+                team_id=team_id,
+                action=str(action),
+                map_name=str(map_name),
+            )
         )
 
-    if not rows:
-        return
-
-    ins = pg_insert(VetoAction).values(rows)
-    upd = ins.on_conflict_do_update(
-        constraint="uq_veto_order",
-        set_={
-            "team_id": ins.excluded.team_id,
-            "action": ins.excluded.action,
-            "map_name": ins.excluded.map_name,
-        },
-    )
-    db.execute(upd)
+    if rows:
+        db.add_all(rows)
 
 
 def _replace_match_maps(
@@ -269,31 +267,22 @@ def _replace_match_maps(
         db.add_all(out)
 
 
-def _upsert_stats_page(
+def _replace_stats_page(
     db: Session,
     match_id: int,
     stats_match_id: int,
     stats_match_slug: Optional[str],
     map_name: Optional[str],
 ) -> None:
-    stmt = (
-        pg_insert(MatchStatsPage)
-        .values(
+    db.execute(delete(MatchStatsPage).where(MatchStatsPage.match_id == match_id))
+    db.add(
+        MatchStatsPage(
             match_id=match_id,
             stats_match_id=stats_match_id,
             stats_match_slug=stats_match_slug,
             map_name=map_name,
         )
-        .on_conflict_do_update(
-            constraint="uq_match_stats_pages_stats_match_id",
-            set_={
-                "match_id": match_id,
-                "stats_match_slug": stats_match_slug,
-                "map_name": map_name,
-            },
-        )
     )
-    db.execute(stmt)
 
 
 def _replace_player_stats(
@@ -333,7 +322,7 @@ def _replace_player_stats(
             if not isinstance(player_name, str) or not player_name.strip():
                 continue
 
-            pid = _ensure_player(db, player_name.strip())
+            pid = _get_or_create_player(db, player_name.strip())
 
             k, hs = _parse_k_hs(r.get("K (hs)"))
             d = _parse_deaths(r.get("D (t)"))
@@ -373,7 +362,7 @@ def _pick_map_name_for_stats(payload: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def ingest_files(db: Session, jsonl_paths: List[Path], commit_every: int) -> Tuple[int, int, int]:
+def ingest_files(db: Session, jsonl_paths: List[Path], commit_every: int, has_stats_tables: bool) -> Tuple[int, int, int]:
     ok = 0
     skipped = 0
     failed = 0
@@ -391,8 +380,8 @@ def ingest_files(db: Session, jsonl_paths: List[Path], commit_every: int) -> Tup
             continue
 
         try:
-            t1_id = _ensure_team(db, team1_name.strip())
-            t2_id = _ensure_team(db, team2_name.strip())
+            t1_id = _get_or_create_team(db, team1_name.strip())
+            t2_id = _get_or_create_team(db, team2_name.strip())
 
             name_to_id = {
                 (_lower(team1_name) or ""): t1_id,
@@ -431,33 +420,36 @@ def ingest_files(db: Session, jsonl_paths: List[Path], commit_every: int) -> Tup
                 team2_id=t2_id,
             )
 
-            stats_match_id = _parse_int(payload.get("stats_match_id"))
-            if stats_match_id:
-                _upsert_stats_page(
-                    db,
-                    match_id=match_id,
-                    stats_match_id=stats_match_id,
-                    stats_match_slug=payload.get("stats_match_slug") if isinstance(payload.get("stats_match_slug"), str) else None,
-                    map_name=_pick_map_name_for_stats(payload),
-                )
+            if has_stats_tables:
+                stats_match_id = _parse_int(payload.get("stats_match_id"))
+                if stats_match_id:
+                    _replace_stats_page(
+                        db,
+                        match_id=match_id,
+                        stats_match_id=stats_match_id,
+                        stats_match_slug=payload.get("stats_match_slug") if isinstance(payload.get("stats_match_slug"), str) else None,
+                        map_name=_pick_map_name_for_stats(payload),
+                    )
 
-                base_tables = payload.get("base_tables") if isinstance(payload.get("base_tables"), list) else []
-                _replace_player_stats(
-                    db,
-                    match_id=match_id,
-                    stats_match_id=stats_match_id,
-                    base_tables=base_tables,
-                    team_name_to_id=name_to_id,
-                )
+                    base_tables = payload.get("base_tables") if isinstance(payload.get("base_tables"), list) else []
+                    _replace_player_stats(
+                        db,
+                        match_id=match_id,
+                        stats_match_id=stats_match_id,
+                        base_tables=base_tables,
+                        team_name_to_id=name_to_id,
+                    )
 
             ok += 1
 
             if n % commit_every == 0:
                 db.commit()
+                print(f"[OK] committed {n} rows... (ok={ok}, skipped={skipped}, failed={failed})")
 
-        except Exception:
+        except Exception as e:
             db.rollback()
             failed += 1
+            print(f"[FAIL] {p.name}:{line_no} match_id={match_id} err={type(e).__name__}: {e}")
 
     db.commit()
     return ok, skipped, failed
@@ -467,13 +459,20 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("jsonl", nargs="+")
     ap.add_argument("--commit-every", type=int, default=200)
+    ap.add_argument("--create-tables", action="store_true")
     args = ap.parse_args()
 
-    db_url = os.getenv("DATABASE_URL")
-    if not db_url:
-        raise SystemExit("DATABASE_URL is not set")
-
+    db_url = get_env("DATABASE_URL")
     engine = create_engine(db_url, pool_pre_ping=True)
+
+    if args.create_tables:
+        Base.metadata.create_all(bind=engine)
+
+    insp = sa_inspect(engine)
+    table_names = set(insp.get_table_names())
+    stats_tables = {MatchStatsPage.__tablename__, PlayerMapStat.__tablename__}
+    has_stats_tables = stats_tables.issubset(table_names)
+
     SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
     paths = [Path(x) for x in args.jsonl]
@@ -482,9 +481,9 @@ def main() -> None:
             raise SystemExit(f"missing file: {p}")
 
     with SessionLocal() as db:
-        ok, skipped, failed = ingest_files(db, paths, commit_every=int(args.commit_every))
+        ok, skipped, failed = ingest_files(db, paths, commit_every=int(args.commit_every), has_stats_tables=has_stats_tables)
 
-    print(f"Done. ok={ok}, skipped={skipped}, failed={failed}")
+    print(f"Done. ok={ok}, skipped={skipped}, failed={failed}, has_stats_tables={has_stats_tables}")
 
 
 if __name__ == "__main__":
