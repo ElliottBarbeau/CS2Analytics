@@ -24,6 +24,7 @@ except Exception:
 OUT_DIR_DEFAULT = "data/raw"
 
 MATCH_ID_RE = re.compile(r"/matches/(\d+)/", re.IGNORECASE)
+EVENT_ID_RE = re.compile(r"/events/(\d+)/", re.I)
 STATS_MATCH_LINK_RE = re.compile(r"^/stats/matches/(?:(mapstatsid)/)?(\d+)/(.+)$", re.IGNORECASE)
 
 CF_MARKERS = (
@@ -154,6 +155,22 @@ def is_blocked(html: str) -> bool:
 def fetch(scraper: cloudscraper.CloudScraper, url: str, timeout: int) -> str:
     r = scraper.get(url, timeout=timeout)
     return r.text
+
+
+def extract_event_id(match_html: str) -> Optional[int]:
+    soup = BeautifulSoup(match_html, "html.parser")
+
+    for a in soup.select('a[href^="/events/"]'):
+        href = a.get("href") or ""
+        m = EVENT_ID_RE.search(href)
+        if m:
+            return int(m.group(1))
+
+    m2 = EVENT_ID_RE.search(match_html or "")
+    if m2:
+        return int(m2.group(1))
+
+    return None
 
 
 def extract_match_id(match_url: str) -> Optional[int]:
@@ -653,6 +670,7 @@ def main() -> None:
                 country = extract_event_country(match_html)
                 tz_name = resolve_timezone_name(country)
                 weekday = weekday_in_event_tz(timestamp, tz_name)
+                event_id = extract_event_id(match_html)
 
                 is_seeding, seeding_note = parse_seeding_info(match_html)
                 is_third_place, third_place_note = parse_third_place_decider(match_html)
@@ -674,6 +692,7 @@ def main() -> None:
                                 {
                                     "match_id": match_id,
                                     "match_url": match_url,
+                                    "event_id": event_id,
                                     "team1_name": team1_name,
                                     "team2_name": team2_name,
                                     "timestamp": timestamp,
@@ -704,6 +723,7 @@ def main() -> None:
                             {
                                 "match_id": match_id,
                                 "match_url": match_url,
+                                "event_id": event_id,
                                 "team1_name": team1_name,
                                 "team2_name": team2_name,
                                 "timestamp": timestamp,
@@ -737,6 +757,7 @@ def main() -> None:
                         {
                             "match_id": match_id,
                             "match_url": match_url,
+                            "event_id": event_id,
                             "team1_name": team1_name,
                             "team2_name": team2_name,
                             "timestamp": timestamp,
