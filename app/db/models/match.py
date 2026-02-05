@@ -1,4 +1,4 @@
-from sqlalchemy import Integer, String
+from sqlalchemy import Boolean, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -14,3 +14,6 @@ class Match(Base):
 
     team1_id: Mapped[int] = mapped_column(Integer, index=True)
     team2_id: Mapped[int] = mapped_column(Integer, index=True)
+
+    is_seeding_match: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_third_place_decider: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
