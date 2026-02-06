@@ -10,6 +10,7 @@ from app.db.models.match_map import MatchMap
 from app.db.models.player import Player
 from app.db.models.team import Team
 from app.db.models.veto_action import VetoAction
+from app.db.models.match_stats import PlayerMapStat
 
 router = APIRouter(prefix="/debug", tags=["debug"])
 
@@ -21,11 +22,12 @@ def _count(db: Session, model) -> int:
 @router.get("/counts")
 def counts(db: Session = Depends(get_db)):
     return {
-        "teams": _count(db, Team),
-        "players": _count(db, Player),
-        "matches": _count(db, Match),
-        "match_maps": _count(db, MatchMap),
-        "veto_actions": _count(db, VetoAction),
+        "teams": int(db.scalar(select(func.count()).select_from(Team)) or 0),
+        "players": int(db.scalar(select(func.count()).select_from(Player)) or 0),
+        "matches": int(db.scalar(select(func.count()).select_from(Match)) or 0),
+        "match_maps": int(db.scalar(select(func.count()).select_from(MatchMap)) or 0),
+        "veto_actions": int(db.scalar(select(func.count()).select_from(VetoAction)) or 0),
+        "player_map_stats": int(db.scalar(select(func.count()).select_from(PlayerMapStat)) or 0),
     }
 
 

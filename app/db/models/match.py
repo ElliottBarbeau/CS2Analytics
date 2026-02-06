@@ -15,8 +15,11 @@ class Match(Base):
     team1_id: Mapped[int] = mapped_column(Integer, index=True)
     team2_id: Mapped[int] = mapped_column(Integer, index=True)
 
+    is_seeding_match: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_third_place_decider: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
     event_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
     series_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
 
-    is_seeding_match: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    is_third_place_decider: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    stats_match_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
+    stats_match_slug: Mapped[str | None] = mapped_column(String(128), nullable=True)
