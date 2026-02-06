@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+import time
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, select
+from sqlalchemy import Float, and_, cast, func, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
 from app.db.models.match import Match
-from app.db.models.player import Player
+from app.db.models.match_map import MatchMap
 from app.db.models.match_stats import PlayerMapStat
+from app.db.models.player import Player
+
 
 router = APIRouter(prefix="/players", tags=["players"])
 
-DOW = {
+
+_WEEKDAY_TO_DOW = {
     "sunday": 0,
     "monday": 1,
     "tuesday": 2,
@@ -23,20 +29,10 @@ DOW = {
 
 
 @router.get("/")
-def list_players(
-    q: str | None = Query(None),
-    limit: int = Query(50, ge=1, le=200),
-    db: Session = Depends(get_db),
-):
+def list_players(limit: int = Query(50, ge=1, le=500), q: Optional[str] = None, db: Session = Depends(get_db)):
     stmt = select(Player.id, Player.name).order_by(Player.name.asc()).limit(limit)
-    if q and q.strip():
-        qq = q.strip().lower()
-        stmt = (
-            select(Player.id, Player.name)
-            .where(func.lower(Player.name).contains(qq))
-            .order_by(Player.name.asc())
-            .limit(limit)
-        )
+    if q:
+        stmt = stmt.where(func.lower(Player.name).like(f"%{q.strip().lower()}%"))
     rows = db.execute(stmt).all()
     return [{"id": int(r.id), "name": r.name} for r in rows]
 
@@ -50,21 +46,12 @@ def player_by_name(name: str, db: Session = Depends(get_db)):
     return {"id": int(row.id), "name": row.name}
 
 
-def _dow_filter(dow: str | None):
-    if not dow:
-        return None
-    key = dow.strip().lower()
-    if key not in DOW:
-        raise HTTPException(status_code=400, detail="weekday must be Sunday..Saturday")
-    return DOW[key]
-
-
 @router.get("/{player_id}/summary")
 def player_summary(
     player_id: int,
     windows: str = Query("30,90,365"),
-    weekday: str | None = Query(None),
-    map_name: str | None = Query(None),
+    weekday: Optional[str] = Query(None),
+    map_name: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
     w = []
@@ -73,72 +60,88 @@ def player_summary(
         if not part:
             continue
         try:
-            v = int(part)
+            w.append(int(part))
         except Exception:
             continue
-        if 1 <= v <= 3650:
-            w.append(v)
+    w = [x for x in w if 1 <= x <= 3650]
     if not w:
-        w = [30, 90, 365]
+        raise HTTPException(status_code=400, detail="Invalid windows")
 
-    dow_val = _dow_filter(weekday)
-    map_lc = map_name.strip().lower() if map_name and map_name.strip() else None
-
-    now = int(db.scalar(select(func.max(Match.played_at))) or 0)
-    if not now:
-        raise HTTPException(status_code=404, detail="No matches in DB")
-
-    player = db.execute(select(Player.id, Player.name).where(Player.id == player_id)).first()
-    if not player:
+    player_row = db.execute(select(Player.id, Player.name).where(Player.id == player_id)).first()
+    if not player_row:
         raise HTTPException(status_code=404, detail="Player not found")
 
-    def one_window(days: int):
-        cutoff = now - days * 24 * 60 * 60
+    dow = None
+    if weekday:
+        key = weekday.strip().lower()
+        if key not in _WEEKDAY_TO_DOW:
+            raise HTTPException(status_code=400, detail="weekday must be Monday..Sunday")
+        dow = _WEEKDAY_TO_DOW[key]
 
-        stmt = (
+    mn = map_name.strip().lower() if map_name else None
+
+    def one_window(days: int):
+        cutoff = int(time.time()) - days * 24 * 60 * 60
+
+        rounds_expr = func.coalesce(MatchMap.team1_rounds, 0) + func.coalesce(MatchMap.team2_rounds, 0)
+
+        base = (
             select(
-                func.count().label("maps"),
-                func.avg(PlayerMapStat.rating3).label("avg_rating3"),
-                func.avg(PlayerMapStat.adr).label("avg_adr"),
-                func.avg(PlayerMapStat.kast).label("avg_kast"),
-                func.sum(PlayerMapStat.kills).label("kills"),
-                func.sum(PlayerMapStat.deaths).label("deaths"),
-                func.sum(PlayerMapStat.assists).label("assists"),
+                func.count(func.distinct(PlayerMapStat.stats_match_id)).label("maps"),
+                func.count(func.distinct(PlayerMapStat.match_id)).label("matches"),
+                func.sum(rounds_expr).label("rounds"),
+                func.sum(func.coalesce(PlayerMapStat.kills, 0)).label("kills"),
+                func.sum(func.coalesce(PlayerMapStat.deaths, 0)).label("deaths"),
+                func.sum(func.coalesce(PlayerMapStat.assists, 0)).label("assists"),
+                (func.sum(cast(PlayerMapStat.rating3, Float) * rounds_expr) / func.nullif(func.sum(rounds_expr), 0)).label("rating3"),
+                (func.sum(cast(PlayerMapStat.adr, Float) * rounds_expr) / func.nullif(func.sum(rounds_expr), 0)).label("adr"),
+                (func.sum(cast(PlayerMapStat.kast, Float) * rounds_expr) / func.nullif(func.sum(rounds_expr), 0)).label("kast"),
             )
             .select_from(PlayerMapStat)
             .join(Match, Match.id == PlayerMapStat.match_id)
+            .join(
+                MatchMap,
+                and_(
+                    MatchMap.match_id == PlayerMapStat.match_id,
+                    func.lower(MatchMap.map_name) == func.lower(PlayerMapStat.map_name),
+                ),
+            )
             .where(
                 PlayerMapStat.player_id == player_id,
                 PlayerMapStat.segment == "total",
+                PlayerMapStat.map_name.is_not(None),
                 Match.played_at >= cutoff,
             )
         )
 
-        if dow_val is not None:
-            stmt = stmt.where(func.extract("dow", func.to_timestamp(Match.played_at)) == dow_val)
+        if mn:
+            base = base.where(func.lower(PlayerMapStat.map_name) == mn)
 
-        if map_lc is not None:
-            stmt = stmt.where(func.lower(PlayerMapStat.map_name) == map_lc)
+        if dow is not None:
+            base = base.where(func.extract("dow", func.to_timestamp(Match.played_at)) == dow)
 
-        row = db.execute(stmt).first()
+        row = db.execute(base).first()
         maps = int(row.maps or 0)
+        matches = int(row.matches or 0)
+        rounds = int(row.rounds or 0)
 
         return {
             "window_days": days,
+            "matches": matches,
             "maps": maps,
-            "avg_rating3": float(row.avg_rating3) if row.avg_rating3 is not None else None,
-            "avg_adr": float(row.avg_adr) if row.avg_adr is not None else None,
-            "avg_kast": float(row.avg_kast) if row.avg_kast is not None else None,
+            "rounds": rounds,
+            "rating3": float(row.rating3) if row.rating3 is not None else None,
+            "adr": float(row.adr) if row.adr is not None else None,
+            "kast": float(row.kast) if row.kast is not None else None,
             "kills": int(row.kills or 0),
             "deaths": int(row.deaths or 0),
             "assists": int(row.assists or 0),
         }
 
-    out = [one_window(days) for days in sorted(set(w))]
     return {
-        "player_id": int(player.id),
-        "player_name": player.name,
+        "player_id": int(player_row.id),
+        "player_name": player_row.name,
         "weekday": weekday,
         "map_name": map_name,
-        "windows": out,
+        "windows": [one_window(days) for days in w],
     }

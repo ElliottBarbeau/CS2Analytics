@@ -26,6 +26,7 @@ OUT_DIR_DEFAULT = "data/raw"
 MATCH_ID_RE = re.compile(r"/matches/(\d+)/", re.IGNORECASE)
 EVENT_ID_RE = re.compile(r"/events/(\d+)/", re.I)
 STATS_MATCH_LINK_RE = re.compile(r"^/stats/matches/(?:(mapstatsid)/)?(\d+)/(.+)$", re.IGNORECASE)
+STATS_MATCH_LINK_RE_ANY = re.compile(r'/stats/matches/(?:(mapstatsid)/)?(\d+)/([^"\'\s<>]+)', re.IGNORECASE)
 
 CF_MARKERS = (
     "_cf_chl_opt",
@@ -129,7 +130,6 @@ NO_STATS_KEYWORDS = [
     "canceled",
 ]
 
-
 SEEDING_VERB_RE = re.compile(
     r"\b(advance(?:s|d)?|proceed(?:s|ed)?|qualif(?:y|ies|ied)|go(?:es)?|progress(?:es|ed)?|secure(?:s|d)?|book(?:s|ed)?)\b",
     re.I,
@@ -194,6 +194,46 @@ def extract_stats_match_ref(match_html: str) -> Optional[Tuple[str, int, str]]:
         return kind, int(m2.group(2)), m2.group(3)
 
     return None
+
+
+def extract_all_mapstats_refs(match_html: str) -> List[Tuple[str, int, str]]:
+    soup = BeautifulSoup(match_html, "html.parser")
+
+    refs: List[Tuple[str, int, str]] = []
+    for a in soup.select('a[href^="/stats/matches/"]'):
+        href = (a.get("href") or "").strip()
+        m = STATS_MATCH_LINK_RE.match(href)
+        if not m:
+            continue
+        kind = "mapstatsid" if m.group(1) else "matchid"
+        stats_id = int(m.group(2))
+        slug = m.group(3)
+        refs.append((kind, stats_id, slug))
+
+    if not refs:
+        for m in STATS_MATCH_LINK_RE_ANY.finditer(match_html or ""):
+            kind = "mapstatsid" if m.group(1) else "matchid"
+            stats_id = int(m.group(2))
+            slug = m.group(3)
+            refs.append((kind, stats_id, slug))
+
+    seen = set()
+    out: List[Tuple[str, int, str]] = []
+    for kind, sid, slug in refs:
+        key = (kind, sid)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((kind, sid, slug))
+
+    mapstats = [x for x in out if x[0] == "mapstatsid"]
+    if mapstats:
+        return mapstats
+
+    if out:
+        return [out[0]]
+
+    return []
 
 
 def build_stats_urls(kind: str, stats_id: int, slug: str) -> Dict[str, str]:
@@ -391,6 +431,97 @@ def parse_all_tables(html: str) -> List[Dict[str, Any]]:
         out.append({"table_index": idx, "caption": caption, "columns": columns, "rows": data_rows})
 
     return out
+
+
+def extract_map_name_from_stats_page(stats_html: str) -> Optional[str]:
+    soup = BeautifulSoup(stats_html, "html.parser")
+
+    for sel in (
+        ".stats-match-header .stats-match-map",
+        ".stats-match-header-map",
+        ".stats-match-header-mapname",
+        ".stats-match-map",
+        ".stats-match-mapname",
+        ".mapname",
+        ".map-name",
+        "[data-map]",
+    ):
+        el = soup.select_one(sel)
+        if el:
+            if el.has_attr("data-map"):
+                v = str(el.get("data-map") or "").strip()
+                if v:
+                    return v
+            t = el.get_text(" ", strip=True)
+            if t:
+                return t
+
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    m = re.search(r"\b(Nuke|Mirage|Inferno|Dust2|Ancient|Anubis|Overpass|Vertigo|Train|Cache|Cobblestone)\b", title, re.I)
+    if m:
+        return m.group(1)
+
+    return None
+
+
+def compact_total_table_for_one_map(
+    base_tables: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    by_team: List[Dict[str, Any]] = []
+
+    for t in base_tables:
+        idx = t.get("table_index")
+        if not isinstance(idx, int):
+            try:
+                idx = int(idx)
+            except Exception:
+                continue
+        if idx % 3 != 0:
+            continue
+
+        cols = t.get("columns") or []
+        rows = t.get("rows") or []
+        if not isinstance(cols, list) or not isinstance(rows, list) or not cols:
+            continue
+        team_header = cols[0]
+        if not isinstance(team_header, str) or not team_header.strip():
+            continue
+
+        out_rows: List[Dict[str, Any]] = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            player = r.get(team_header)
+            if not isinstance(player, str) or not player.strip():
+                continue
+            rr = dict(r)
+            rr.pop(team_header, None)
+            rr["Team"] = team_header
+            rr["Player"] = player.strip()
+            out_rows.append(rr)
+
+        if out_rows:
+            by_team.append({"team": team_header, "rows": out_rows})
+
+    if not by_team:
+        return None
+
+    merged_rows: List[Dict[str, Any]] = []
+    for block in by_team:
+        merged_rows.extend(block["rows"])
+
+    cols_union = []
+    seen = set()
+    for r in merged_rows:
+        for k in r.keys():
+            if k not in seen:
+                seen.add(k)
+                cols_union.append(k)
+
+    preferred = ["Team", "Player"]
+    cols_union = preferred + [c for c in cols_union if c not in preferred]
+
+    return {"columns": cols_union, "rows": merged_rows}
 
 
 def read_match_urls_from_csv(path: Path, url_column: str) -> List[str]:
@@ -639,12 +770,20 @@ def main() -> None:
     if match_urls:
         try:
             first_html = fetch(scraper, match_urls[0], args.timeout)
-            ref0 = extract_stats_match_ref(first_html)
-            if ref0 is None and is_blocked(first_html):
+            refs0 = extract_all_mapstats_refs(first_html)
+            if not refs0 and is_blocked(first_html):
                 first_url_hard_fail = True
-            elif ref0 is None and not is_blocked(first_html):
+            elif not refs0 and not is_blocked(first_html):
                 is_no_stats0, _ = looks_like_no_stats_match(first_html)
                 if not is_no_stats0:
+                    first_url_hard_fail = True
+            elif refs0:
+                kind0, stats_id0, slug0 = refs0[0]
+                urls0 = build_stats_urls(kind0, stats_id0, slug0)
+                base0 = fetch(scraper, urls0["base"], args.timeout)
+                tables0 = parse_all_tables(base0)
+                compact0 = compact_total_table_for_one_map(tables0)
+                if compact0 is None and not is_blocked(base0):
                     first_url_hard_fail = True
         except Exception:
             first_url_hard_fail = True
@@ -675,9 +814,10 @@ def main() -> None:
                 is_seeding, seeding_note = parse_seeding_info(match_html)
                 is_third_place, third_place_note = parse_third_place_decider(match_html)
                 veto = parse_veto(match_html)
+                map_results = parse_map_results(match_html)
 
-                ref = extract_stats_match_ref(match_html)
-                if not ref:
+                refs = extract_all_mapstats_refs(match_html)
+                if not refs:
                     no_stats_ref += 1
 
                     is_no_stats, no_stats_note = looks_like_no_stats_match(match_html)
@@ -704,6 +844,7 @@ def main() -> None:
                                     "is_third_place_decider": is_third_place,
                                     "third_place_note": third_place_note,
                                     "veto": veto,
+                                    "map_results": map_results,
                                     "error": "NO_STATS_FORFEIT_OR_CANCELLED",
                                     "no_stats_note": no_stats_note,
                                 },
@@ -735,6 +876,7 @@ def main() -> None:
                                 "is_third_place_decider": is_third_place,
                                 "third_place_note": third_place_note,
                                 "veto": veto,
+                                "map_results": map_results,
                                 "error": "NO_STATS_MATCH_REF_SKIPPED",
                             },
                             ensure_ascii=False,
@@ -745,12 +887,26 @@ def main() -> None:
                     time.sleep(args.delay)
                     continue
 
-                kind, stats_id, slug = ref
-                stats_urls = build_stats_urls(kind, stats_id, slug)
-
-                base_html = fetch(scraper, stats_urls["base"], args.timeout)
-                base_tables = parse_all_tables(base_html)
-                map_results = parse_map_results(match_html)
+                stats_maps: List[Dict[str, Any]] = []
+                for i, (kind, stats_id, slug) in enumerate(refs):
+                    stats_urls = build_stats_urls(kind, stats_id, slug)
+                    base_html = fetch(scraper, stats_urls["base"], args.timeout)
+                    base_tables = parse_all_tables(base_html)
+                    compact = compact_total_table_for_one_map(base_tables)
+                    if compact is None:
+                        continue
+                    map_name = extract_map_name_from_stats_page(base_html)
+                    if not map_name and i < len(map_results):
+                        map_name = map_results[i].get("map")
+                    stats_maps.append(
+                        {
+                            "stats_match_id": stats_id,
+                            "stats_match_slug": slug,
+                            "stats_urls": stats_urls,
+                            "map_name": map_name,
+                            "table": compact,
+                        }
+                    )
 
                 fout.write(
                     json.dumps(
@@ -770,10 +926,7 @@ def main() -> None:
                             "third_place_note": third_place_note,
                             "veto": veto,
                             "map_results": map_results,
-                            "stats_match_id": stats_id,
-                            "stats_match_slug": slug,
-                            "stats_urls": stats_urls,
-                            "base_tables": base_tables,
+                            "stats_maps": stats_maps,
                         },
                         ensure_ascii=False,
                     )

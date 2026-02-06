@@ -13,10 +13,10 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.core.config import get_env
 from app.db.models.match import Match
 from app.db.models.match_map import MatchMap
+from app.db.models.match_stats import PlayerMapStat
 from app.db.models.player import Player
 from app.db.models.team import Team
 from app.db.models.veto_action import VetoAction
-from app.db.models.match_stats import PlayerMapStat
 
 
 KHS_RE = re.compile(r"^\s*(\d+)\s*\(\s*(\d+)\s*\)\s*$")
@@ -30,40 +30,40 @@ def _lower(s: Optional[str]) -> Optional[str]:
     return s.strip().lower()
 
 
-def _parse_int(s: Any) -> Optional[int]:
-    if s is None:
+def _parse_int(v: Any) -> Optional[int]:
+    if v is None:
         return None
-    if isinstance(s, int):
-        return s
-    if isinstance(s, float):
-        return int(s)
-    if isinstance(s, str):
-        m = NUM_RE.match(s.strip())
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float):
+        return int(v)
+    if isinstance(v, str):
+        m = NUM_RE.match(v.strip())
         if m:
             return int(m.group(1))
     return None
 
 
-def _parse_float(s: Any) -> Optional[float]:
-    if s is None:
+def _parse_float(v: Any) -> Optional[float]:
+    if v is None:
         return None
-    if isinstance(s, (int, float)):
-        return float(s)
-    if isinstance(s, str):
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
         try:
-            return float(s.strip())
+            return float(v.strip())
         except Exception:
             return None
     return None
 
 
-def _parse_pct_to_float(s: Any) -> Optional[float]:
-    if s is None:
+def _parse_pct_to_float(v: Any) -> Optional[float]:
+    if v is None:
         return None
-    if isinstance(s, (int, float)):
-        return float(s)
-    if isinstance(s, str):
-        m = PCT_RE.match(s.strip())
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        m = PCT_RE.match(v.strip())
         if not m:
             return None
         return float(m.group(1)) / 100.0
@@ -97,15 +97,6 @@ def _parse_deaths(v: Any) -> Optional[int]:
         if m:
             return int(m.group(1))
     return None
-
-
-def _pick_segment(table_index: int) -> str:
-    mod = table_index % 3
-    if mod == 0:
-        return "total"
-    if mod == 1:
-        return "t"
-    return "ct"
 
 
 def _iter_jsonl(paths: List[Path]) -> Iterable[Tuple[Path, int, Dict[str, Any]]]:
@@ -154,8 +145,6 @@ def _upsert_match(
     is_third_place_decider: bool,
     event_id: Optional[int],
     series_id: Optional[int],
-    stats_match_id: Optional[int],
-    stats_match_slug: Optional[str],
 ) -> None:
     stmt = (
         pg_insert(Match)
@@ -170,8 +159,6 @@ def _upsert_match(
             is_third_place_decider=bool(is_third_place_decider),
             event_id=event_id,
             series_id=series_id,
-            stats_match_id=stats_match_id,
-            stats_match_slug=stats_match_slug,
         )
         .on_conflict_do_update(
             index_elements=[Match.id],
@@ -184,8 +171,6 @@ def _upsert_match(
                 "is_third_place_decider": bool(is_third_place_decider),
                 "event_id": event_id,
                 "series_id": series_id,
-                "stats_match_id": stats_match_id,
-                "stats_match_slug": stats_match_slug,
             },
         )
     )
@@ -273,29 +258,91 @@ def _replace_match_maps(
         db.add_all(out)
 
 
-def _pick_map_name_for_stats(payload: Dict[str, Any]) -> Optional[str]:
-    mr = payload.get("map_results")
-    if isinstance(mr, list) and mr:
-        m0 = mr[0]
-        if isinstance(m0, dict) and isinstance(m0.get("map"), str):
-            return m0["map"]
-    return None
-
-
-def _replace_player_stats(
+def _replace_player_stats_compact_table(
     db: Session,
     match_id: int,
     stats_match_id: int,
+    map_name: Optional[str],
+    table: Dict[str, Any],
+    team_name_to_id: Dict[str, int],
+) -> None:
+    db.execute(delete(PlayerMapStat).where(PlayerMapStat.stats_match_id == stats_match_id))
+
+    cols = table.get("columns") or []
+    rows = table.get("rows") or []
+    if not isinstance(cols, list) or not isinstance(rows, list) or not rows:
+        return
+
+    bulk: List[PlayerMapStat] = []
+
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+
+        player_name = r.get("Player")
+        if not isinstance(player_name, str) or not player_name.strip():
+            continue
+
+        team_name = r.get("Team")
+        team_id = None
+        if isinstance(team_name, str):
+            team_id = team_name_to_id.get(_lower(team_name) or "")
+
+        pid = _ensure_player(db, player_name.strip())
+
+        k, hs = _parse_k_hs(r.get("K (hs)"))
+        d = _parse_deaths(r.get("D (t)"))
+        a = _parse_deaths(r.get("A (f)"))
+        adr = _parse_float(r.get("ADR"))
+        kast = _parse_pct_to_float(r.get("KAST"))
+        rating3 = _parse_float(r.get("Rating3.0"))
+
+        bulk.append(
+            PlayerMapStat(
+                match_id=match_id,
+                stats_match_id=stats_match_id,
+                team_id=team_id,
+                player_id=pid,
+                map_name=map_name,
+                segment="total",
+                kills=k,
+                deaths=d,
+                assists=a,
+                hs_kills=hs,
+                adr=adr,
+                kast=kast,
+                rating3=rating3,
+                raw=r,
+            )
+        )
+
+    if bulk:
+        db.add_all(bulk)
+
+
+def _pick_segment(table_index: int) -> str:
+    mod = table_index % 3
+    if mod == 0:
+        return "total"
+    if mod == 1:
+        return "t"
+    return "ct"
+
+
+def _replace_player_stats_for_base_tables(
+    db: Session,
+    match_id: int,
+    stats_match_id: int,
+    map_name: Optional[str],
     base_tables: List[Dict[str, Any]],
     team_name_to_id: Dict[str, int],
-    map_name: Optional[str],
 ) -> None:
     db.execute(delete(PlayerMapStat).where(PlayerMapStat.stats_match_id == stats_match_id))
 
     if not base_tables:
         return
 
-    bulk_rows = []
+    bulk: List[PlayerMapStat] = []
 
     for t in base_tables:
         table_index = _parse_int(t.get("table_index"))
@@ -329,46 +376,77 @@ def _replace_player_stats(
             kast = _parse_pct_to_float(r.get("KAST"))
             rating3 = _parse_float(r.get("Rating3.0"))
 
-            bulk_rows.append(
-                {
-                    "match_id": match_id,
-                    "stats_match_id": stats_match_id,
-                    "team_id": team_id,
-                    "player_id": pid,
-                    "map_name": map_name,
-                    "segment": segment,
-                    "kills": k,
-                    "deaths": d,
-                    "assists": a,
-                    "hs_kills": hs,
-                    "adr": adr,
-                    "kast": kast,
-                    "rating3": rating3,
-                    "raw": r,
-                }
+            bulk.append(
+                PlayerMapStat(
+                    match_id=match_id,
+                    stats_match_id=stats_match_id,
+                    team_id=team_id,
+                    player_id=pid,
+                    map_name=map_name,
+                    segment=segment,
+                    kills=k,
+                    deaths=d,
+                    assists=a,
+                    hs_kills=hs,
+                    adr=adr,
+                    kast=kast,
+                    rating3=rating3,
+                    raw=r,
+                )
             )
 
-    if not bulk_rows:
-        return
+    if bulk:
+        db.add_all(bulk)
 
-    ins = pg_insert(PlayerMapStat).values(bulk_rows)
-    upd = ins.on_conflict_do_update(
-        constraint="uq_player_map_stats_row",
-        set_={
-            "match_id": ins.excluded.match_id,
-            "team_id": ins.excluded.team_id,
-            "map_name": ins.excluded.map_name,
-            "kills": ins.excluded.kills,
-            "deaths": ins.excluded.deaths,
-            "assists": ins.excluded.assists,
-            "hs_kills": ins.excluded.hs_kills,
-            "adr": ins.excluded.adr,
-            "kast": ins.excluded.kast,
-            "rating3": ins.excluded.rating3,
-            "raw": ins.excluded.raw,
-        },
-    )
-    db.execute(upd)
+
+def _extract_stats_blocks(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    sm = payload.get("stats_maps")
+    if isinstance(sm, list) and sm:
+        out = []
+        for x in sm:
+            if not isinstance(x, dict):
+                continue
+            stats_match_id = _parse_int(x.get("stats_match_id"))
+            table = x.get("table")
+            if not stats_match_id or not isinstance(table, dict):
+                continue
+            map_name = x.get("map_name") if isinstance(x.get("map_name"), str) else None
+            out.append(
+                {
+                    "stats_match_id": stats_match_id,
+                    "map_name": map_name,
+                    "table": table,
+                }
+            )
+        if out:
+            return out
+
+    sp = payload.get("stats_pages")
+    if isinstance(sp, list) and sp:
+        out = []
+        for x in sp:
+            if isinstance(x, dict):
+                out.append(x)
+        return out
+
+    stats_match_id = _parse_int(payload.get("stats_match_id"))
+    base_tables = payload.get("base_tables")
+    if stats_match_id and isinstance(base_tables, list) and base_tables:
+        map_name = None
+        mr = payload.get("map_results")
+        if isinstance(mr, list) and mr:
+            m0 = mr[0]
+            if isinstance(m0, dict) and isinstance(m0.get("map"), str):
+                map_name = m0["map"]
+        return [
+            {
+                "stats_match_id": stats_match_id,
+                "map_name": map_name,
+                "base_tables": base_tables,
+            }
+        ]
+
+    return []
 
 
 def ingest_files(db: Session, jsonl_paths: List[Path], commit_every: int) -> Tuple[int, int, int]:
@@ -402,9 +480,6 @@ def ingest_files(db: Session, jsonl_paths: List[Path], commit_every: int) -> Tup
             event_id = _parse_int(payload.get("event_id") or payload.get("eventId"))
             series_id = _parse_int(payload.get("series_id") or payload.get("seriesId"))
 
-            stats_match_id = _parse_int(payload.get("stats_match_id"))
-            stats_match_slug = payload.get("stats_match_slug") if isinstance(payload.get("stats_match_slug"), str) else None
-
             _upsert_match(
                 db,
                 match_id=match_id,
@@ -416,8 +491,6 @@ def ingest_files(db: Session, jsonl_paths: List[Path], commit_every: int) -> Tup
                 is_third_place_decider=is_third,
                 event_id=event_id,
                 series_id=series_id,
-                stats_match_id=stats_match_id,
-                stats_match_slug=stats_match_slug,
             )
 
             veto = payload.get("veto") if isinstance(payload.get("veto"), dict) else None
@@ -434,17 +507,35 @@ def ingest_files(db: Session, jsonl_paths: List[Path], commit_every: int) -> Tup
                 team2_id=t2_id,
             )
 
-            if stats_match_id:
-                base_tables = payload.get("base_tables") if isinstance(payload.get("base_tables"), list) else []
-                map_name = _pick_map_name_for_stats(payload)
-                _replace_player_stats(
-                    db,
-                    match_id=match_id,
-                    stats_match_id=stats_match_id,
-                    base_tables=base_tables,
-                    team_name_to_id=name_to_id,
-                    map_name=map_name,
-                )
+            for sp in _extract_stats_blocks(payload):
+                smid = _parse_int(sp.get("stats_match_id"))
+                if not smid:
+                    continue
+
+                map_name = sp.get("map_name") if isinstance(sp.get("map_name"), str) else None
+
+                table = sp.get("table")
+                if isinstance(table, dict):
+                    _replace_player_stats_compact_table(
+                        db,
+                        match_id=match_id,
+                        stats_match_id=smid,
+                        map_name=map_name,
+                        table=table,
+                        team_name_to_id=name_to_id,
+                    )
+                    continue
+
+                bt = sp.get("base_tables") if isinstance(sp.get("base_tables"), list) else []
+                if bt:
+                    _replace_player_stats_for_base_tables(
+                        db,
+                        match_id=match_id,
+                        stats_match_id=smid,
+                        map_name=map_name,
+                        base_tables=bt,
+                        team_name_to_id=name_to_id,
+                    )
 
             ok += 1
 
@@ -454,7 +545,6 @@ def ingest_files(db: Session, jsonl_paths: List[Path], commit_every: int) -> Tup
         except Exception:
             db.rollback()
             failed += 1
-            print(f"[FAIL] {p.name}:{line_no} match_id={match_id} err=ingest_failed")
 
     db.commit()
     return ok, skipped, failed
