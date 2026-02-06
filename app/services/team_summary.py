@@ -11,7 +11,8 @@ from app.db.models import Match, MatchMap, VetoAction
 
 def get_team_summary(db: Session, team_id: int, now_ts: Optional[int] = None) -> Dict[str, Any]:
     now = int(now_ts or time.time())
-    cutoff_30 = now - 30 * 24 * 60 * 60
+    window_days = 180
+    cutoff = now - window_days * 24 * 60 * 60
 
     permaban_row = db.execute(
         select(
@@ -20,7 +21,7 @@ def get_team_summary(db: Session, team_id: int, now_ts: Optional[int] = None) ->
         )
         .join(Match, Match.id == VetoAction.match_id)
         .where(
-            Match.played_at >= cutoff_30,
+            Match.played_at >= cutoff,
             VetoAction.team_id == team_id,
             VetoAction.action == "removed",
             VetoAction.map_name.is_not(None),
@@ -42,7 +43,7 @@ def get_team_summary(db: Session, team_id: int, now_ts: Optional[int] = None) ->
         )
         .join(Match, Match.id == MatchMap.match_id)
         .where(
-            Match.played_at >= cutoff_30,
+            Match.played_at >= cutoff,
             MatchMap.map_name.is_not(None),
             (Match.team1_id == team_id) | (Match.team2_id == team_id),
         )
@@ -66,7 +67,7 @@ def get_team_summary(db: Session, team_id: int, now_ts: Optional[int] = None) ->
 
     return {
         "team_id": team_id,
-        "window_days": 30,
+        "window_days": window_days,
         "permaban": permaban,
         "strongest_map": strongest,
         "weakest_map": weakest,

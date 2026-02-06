@@ -11,7 +11,6 @@ from app.services.team_list import list_teams
 from app.services.team_summary import get_team_summary
 
 
-
 router = APIRouter(prefix="/teams", tags=["teams"])
 
 
@@ -30,14 +29,18 @@ def is_bo3_veto_shape(db: Session, match_id: int) -> bool:
 @router.get("/{team_id}/permaban")
 def get_permaban(
     team_id: int,
-    window_days: int = Query(30, ge=1, le=365),
-    min_matches: int = Query(5, ge=1, le=200),
+    window_days: int = Query(60, ge=1, le=365),
+    min_matches: int = Query(1, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
-    cutoff = int(time.time()) - 30 * 24 * 60 * 60
+    cutoff = int(time.time()) - int(window_days) * 24 * 60 * 60
 
     match_ids = db.scalars(
-        select(Match.id).where(Match.played_at.is_not(None), Match.played_at >= cutoff)
+        select(Match.id).where(
+            Match.played_at.is_not(None),
+            Match.played_at >= cutoff,
+            (Match.team1_id == team_id) | (Match.team2_id == team_id),
+        )
     ).all()
 
     first_bans = []
@@ -51,12 +54,13 @@ def get_permaban(
                 VetoAction.match_id == mid,
                 VetoAction.team_id == team_id,
                 VetoAction.action == "removed",
+                VetoAction.map_name.is_not(None),
             )
             .order_by(VetoAction.order_index.asc())
             .limit(1)
         ).first()
 
-        if row:
+        if row and row[0]:
             first_bans.append(row[0])
 
     matches_considered = len(first_bans)
@@ -70,13 +74,10 @@ def get_permaban(
     for m in first_bans:
         counts[m] = counts.get(m, 0) + 1
 
-    sorted_maps = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+    sorted_maps = sorted(counts.items(), key=lambda kv: (kv[1], str(kv[0]).lower()), reverse=True)
 
     permaban_map, permaban_count = sorted_maps[0]
-    breakdown = [
-        {"map": m, "count": c, "rate": c / matches_considered}
-        for m, c in sorted_maps
-    ]
+    breakdown = [{"map": m, "count": c, "rate": c / matches_considered} for m, c in sorted_maps]
 
     return {
         "team_id": team_id,
@@ -90,16 +91,17 @@ def get_permaban(
         "breakdown": breakdown,
     }
 
+
 @router.get("/{team_id}/maps/{map_name}/winrate")
 def team_map_winrate(team_id: int, map_name: str, db: Session = Depends(get_db)):
     return get_team_map_winrate(db, team_id=team_id, map_name=map_name)
+
 
 @router.get("/")
 def list_all_teams(db: Session = Depends(get_db)):
     return list_teams(db)
 
+
 @router.get("/{team_id}/summary")
 def team_summary(team_id: int, db: Session = Depends(get_db)):
     return get_team_summary(db, team_id=team_id)
-
-

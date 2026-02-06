@@ -17,18 +17,17 @@ def is_bo3(db: Session, match_id: int) -> bool:
         return False
 
     leftover = db.scalar(
-        select(func.count()).select_from(VetoAction).where(
-            and_(VetoAction.match_id == match_id, VetoAction.action == "left_over")
-        )
+        select(func.count())
+        .select_from(VetoAction)
+        .where(and_(VetoAction.match_id == match_id, VetoAction.action == "left_over"))
     )
     return leftover == 1
 
 
 @router.get("/{team_id}/permaban")
-def permaban_last_30_days(team_id: int, db: Session = Depends(get_db)):
-    cutoff = int(time.time()) - 30 * 24 * 60 * 60
+def permaban_last_60_days(team_id: int, db: Session = Depends(get_db)):
+    cutoff = int(time.time()) - 60 * 24 * 60 * 60
 
-    # matches in last 30 days involving this team
     match_ids = db.scalars(
         select(Match.id).where(
             Match.played_at >= cutoff,
@@ -47,22 +46,23 @@ def permaban_last_30_days(team_id: int, db: Session = Depends(get_db)):
                 VetoAction.match_id == mid,
                 VetoAction.team_id == team_id,
                 VetoAction.action == "removed",
+                VetoAction.map_name.is_not(None),
             )
             .order_by(VetoAction.order_index.asc())
             .limit(1)
         ).first()
 
-        if row:
+        if row and row[0]:
             first_bans.append(row[0])
 
-    if not first_bans:
-        raise HTTPException(status_code=404, detail="No BO3 matches with vetoes in last 30 days")
+    if len(first_bans) < 1:
+        raise HTTPException(status_code=404, detail="No BO3 matches with vetoes in last 60 days")
 
     counts: dict[str, int] = {}
     for m in first_bans:
         counts[m] = counts.get(m, 0) + 1
 
-    sorted_maps = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+    sorted_maps = sorted(counts.items(), key=lambda kv: (kv[1], kv[0]), reverse=True)
     total = len(first_bans)
 
     permaban_map, permaban_count = sorted_maps[0]
@@ -70,7 +70,7 @@ def permaban_last_30_days(team_id: int, db: Session = Depends(get_db)):
 
     return {
         "team_id": team_id,
-        "window_days": 30,
+        "window_days": 60,
         "matches_considered": total,
         "permaban": {"map": permaban_map, "count": permaban_count, "rate": permaban_count / total},
         "breakdown": breakdown,
