@@ -4,7 +4,7 @@ import time
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import Float, and_, cast, func, select
+from sqlalchemy import Float, and_, case, cast, func, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
@@ -84,43 +84,46 @@ def player_summary(
         cutoff = int(time.time()) - days * 24 * 60 * 60
 
         rounds_expr = func.coalesce(MatchMap.team1_rounds, 0) + func.coalesce(MatchMap.team2_rounds, 0)
+        weight = case((rounds_expr > 0, rounds_expr), else_=None)
 
         base = (
             select(
                 func.count(func.distinct(PlayerMapStat.stats_match_id)).label("maps"),
                 func.count(func.distinct(PlayerMapStat.match_id)).label("matches"),
-                func.sum(rounds_expr).label("rounds"),
+                func.sum(func.coalesce(weight, 0)).label("rounds"),
                 func.sum(func.coalesce(PlayerMapStat.kills, 0)).label("kills"),
                 func.sum(func.coalesce(PlayerMapStat.deaths, 0)).label("deaths"),
                 func.sum(func.coalesce(PlayerMapStat.assists, 0)).label("assists"),
-                (func.sum(cast(PlayerMapStat.rating3, Float) * rounds_expr) / func.nullif(func.sum(rounds_expr), 0)).label("rating3"),
-                (func.sum(cast(PlayerMapStat.adr, Float) * rounds_expr) / func.nullif(func.sum(rounds_expr), 0)).label("adr"),
-                (func.sum(cast(PlayerMapStat.kast, Float) * rounds_expr) / func.nullif(func.sum(rounds_expr), 0)).label("kast"),
+                (func.sum(cast(PlayerMapStat.rating3, Float) * weight) / func.nullif(func.sum(weight), 0)).label("rating3"),
+                (func.sum(cast(PlayerMapStat.adr, Float) * weight) / func.nullif(func.sum(weight), 0)).label("adr"),
+                (func.sum(cast(PlayerMapStat.kast, Float) * weight) / func.nullif(func.sum(weight), 0)).label("kast"),
             )
             .select_from(PlayerMapStat)
             .join(Match, Match.id == PlayerMapStat.match_id)
-            .join(
+            .outerjoin(
                 MatchMap,
                 and_(
                     MatchMap.match_id == PlayerMapStat.match_id,
+                    PlayerMapStat.map_name.is_not(None),
                     func.lower(MatchMap.map_name) == func.lower(PlayerMapStat.map_name),
                 ),
             )
             .where(
                 PlayerMapStat.player_id == player_id,
                 PlayerMapStat.segment == "total",
-                PlayerMapStat.map_name.is_not(None),
+                Match.played_at.is_not(None),
                 Match.played_at >= cutoff,
             )
         )
 
         if mn:
-            base = base.where(func.lower(PlayerMapStat.map_name) == mn)
+            base = base.where(PlayerMapStat.map_name.is_not(None), func.lower(PlayerMapStat.map_name) == mn)
 
         if dow is not None:
             base = base.where(func.extract("dow", func.to_timestamp(Match.played_at)) == dow)
 
         row = db.execute(base).first()
+
         maps = int(row.maps or 0)
         matches = int(row.matches or 0)
         rounds = int(row.rounds or 0)
