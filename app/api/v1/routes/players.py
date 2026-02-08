@@ -28,34 +28,8 @@ _WEEKDAY_TO_DOW = {
 }
 
 
-@router.get("/")
-def list_players(limit: int = Query(50, ge=1, le=500), q: Optional[str] = None, db: Session = Depends(get_db)):
-    stmt = select(Player.id, Player.name).order_by(Player.name.asc()).limit(limit)
-    if q:
-        stmt = stmt.where(func.lower(Player.name).like(f"%{q.strip().lower()}%"))
-    rows = db.execute(stmt).all()
-    return [{"id": int(r.id), "name": r.name} for r in rows]
-
-
-@router.get("/by-name/{name}")
-def player_by_name(name: str, db: Session = Depends(get_db)):
-    nm = name.strip().lower()
-    row = db.execute(select(Player.id, Player.name).where(func.lower(Player.name) == nm)).first()
-    if not row:
-        raise HTTPException(status_code=404, detail="Player not found")
-    return {"id": int(row.id), "name": row.name}
-
-
-def _player_summary_impl(
-    player_id: int,
-    player_name_echo: Optional[str],
-    windows: str,
-    weekday: Optional[str],
-    map_name: Optional[str],
-    third_place_decider: Optional[bool],
-    db: Session,
-):
-    w = []
+def _parse_windows(windows: str) -> list[int]:
+    w: list[int] = []
     for part in windows.split(","):
         part = part.strip()
         if not part:
@@ -65,6 +39,35 @@ def _player_summary_impl(
         except Exception:
             continue
     w = [x for x in w if 1 <= x <= 3650]
+    return w
+
+
+def _parse_weekday(weekday: Optional[str]) -> Optional[int]:
+    if not weekday:
+        return None
+    key = weekday.strip().lower()
+    if key not in _WEEKDAY_TO_DOW:
+        raise HTTPException(status_code=400, detail="weekday must be Monday..Sunday")
+    return _WEEKDAY_TO_DOW[key]
+
+
+def _player_id_by_name(db: Session, name: str) -> tuple[int, str]:
+    nm = name.strip().lower()
+    row = db.execute(select(Player.id, Player.name).where(func.lower(Player.name) == nm)).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Player not found")
+    return int(row.id), str(row.name)
+
+
+def _summary_for_player_id(
+    db: Session,
+    player_id: int,
+    windows: str,
+    weekday: Optional[str],
+    map_name: Optional[str],
+    third_place_only: bool,
+):
+    w = _parse_windows(windows)
     if not w:
         raise HTTPException(status_code=400, detail="Invalid windows")
 
@@ -72,13 +75,7 @@ def _player_summary_impl(
     if not player_row:
         raise HTTPException(status_code=404, detail="Player not found")
 
-    dow = None
-    if weekday:
-        key = weekday.strip().lower()
-        if key not in _WEEKDAY_TO_DOW:
-            raise HTTPException(status_code=400, detail="weekday must be Monday..Sunday")
-        dow = _WEEKDAY_TO_DOW[key]
-
+    dow = _parse_weekday(weekday)
     mn = map_name.strip().lower() if map_name else None
 
     def one_window(days: int):
@@ -87,7 +84,7 @@ def _player_summary_impl(
         rounds_expr = func.coalesce(MatchMap.team1_rounds, 0) + func.coalesce(MatchMap.team2_rounds, 0)
         weight = case((rounds_expr > 0, rounds_expr), else_=None)
 
-        stmt = (
+        base = (
             select(
                 func.count(func.distinct(PlayerMapStat.stats_match_id)).label("maps"),
                 func.count(func.distinct(PlayerMapStat.match_id)).label("matches"),
@@ -98,7 +95,6 @@ def _player_summary_impl(
                 (func.sum(cast(PlayerMapStat.rating3, Float) * weight) / func.nullif(func.sum(weight), 0)).label("rating3"),
                 (func.sum(cast(PlayerMapStat.adr, Float) * weight) / func.nullif(func.sum(weight), 0)).label("adr"),
                 (func.sum(cast(PlayerMapStat.kast, Float) * weight) / func.nullif(func.sum(weight), 0)).label("kast"),
-                (func.sum(cast(PlayerMapStat.kills, Float)) / func.nullif(func.sum(weight), 0)).label("kpr"),
             )
             .select_from(PlayerMapStat)
             .join(Match, Match.id == PlayerMapStat.match_id)
@@ -118,27 +114,34 @@ def _player_summary_impl(
             )
         )
 
-        if third_place_decider is not None:
-            stmt = stmt.where(Match.is_third_place_decider == bool(third_place_decider))
+        if third_place_only:
+            base = base.where(Match.is_third_place_decider.is_(True))
 
         if mn:
-            stmt = stmt.where(PlayerMapStat.map_name.is_not(None), func.lower(PlayerMapStat.map_name) == mn)
+            base = base.where(PlayerMapStat.map_name.is_not(None), func.lower(PlayerMapStat.map_name) == mn)
 
         if dow is not None:
-            stmt = stmt.where(func.extract("dow", func.to_timestamp(Match.played_at)) == dow)
+            base = base.where(func.extract("dow", func.to_timestamp(Match.played_at)) == dow)
 
-        row = db.execute(stmt).first()
+        row = db.execute(base).first()
+
+        maps = int(row.maps or 0)
+        matches = int(row.matches or 0)
+        rounds = int(row.rounds or 0)
+        kills = int(row.kills or 0)
+
+        kpr = (kills / rounds) if rounds > 0 else None
 
         return {
             "window_days": days,
-            "matches": int(row.matches or 0),
-            "maps": int(row.maps or 0),
-            "rounds": int(row.rounds or 0),
+            "matches": matches,
+            "maps": maps,
+            "rounds": rounds,
             "rating3": float(row.rating3) if row.rating3 is not None else None,
             "adr": float(row.adr) if row.adr is not None else None,
             "kast": float(row.kast) if row.kast is not None else None,
-            "kpr": float(row.kpr) if row.kpr is not None else None,
-            "kills": int(row.kills or 0),
+            "kpr": float(kpr) if kpr is not None else None,
+            "kills": kills,
             "deaths": int(row.deaths or 0),
             "assists": int(row.assists or 0),
         }
@@ -146,12 +149,26 @@ def _player_summary_impl(
     return {
         "player_id": int(player_row.id),
         "player_name": player_row.name,
-        "player_query": player_name_echo,
         "weekday": weekday,
         "map_name": map_name,
-        "third_place_decider": third_place_decider,
+        "third_place_only": bool(third_place_only),
         "windows": [one_window(days) for days in w],
     }
+
+
+@router.get("/")
+def list_players(limit: int = Query(50, ge=1, le=500), q: Optional[str] = None, db: Session = Depends(get_db)):
+    stmt = select(Player.id, Player.name).order_by(Player.name.asc()).limit(limit)
+    if q:
+        stmt = stmt.where(func.lower(Player.name).like(f"%{q.strip().lower()}%"))
+    rows = db.execute(stmt).all()
+    return [{"id": int(r.id), "name": r.name} for r in rows]
+
+
+@router.get("/by-name/{name}")
+def player_by_name(name: str, db: Session = Depends(get_db)):
+    pid, pname = _player_id_by_name(db, name)
+    return {"id": pid, "name": pname}
 
 
 @router.get("/{player_id}/summary")
@@ -160,18 +177,10 @@ def player_summary(
     windows: str = Query("30,90,365"),
     weekday: Optional[str] = Query(None),
     map_name: Optional[str] = Query(None),
-    third_place_decider: Optional[bool] = Query(None),
+    third_place_only: bool = Query(False),
     db: Session = Depends(get_db),
 ):
-    return _player_summary_impl(
-        player_id=player_id,
-        player_name_echo=None,
-        windows=windows,
-        weekday=weekday,
-        map_name=map_name,
-        third_place_decider=third_place_decider,
-        db=db,
-    )
+    return _summary_for_player_id(db, player_id, windows, weekday, map_name, third_place_only)
 
 
 @router.get("/summary/by-name/{name}")
@@ -180,64 +189,34 @@ def player_summary_by_name(
     windows: str = Query("30,90,365"),
     weekday: Optional[str] = Query(None),
     map_name: Optional[str] = Query(None),
-    third_place_decider: Optional[bool] = Query(None),
+    third_place_only: bool = Query(False),
     db: Session = Depends(get_db),
 ):
-    nm = name.strip().lower()
-    row = db.execute(select(Player.id).where(func.lower(Player.name) == nm)).first()
-    if not row:
-        raise HTTPException(status_code=404, detail="Player not found")
-    return _player_summary_impl(
-        player_id=int(row.id),
-        player_name_echo=name,
-        windows=windows,
-        weekday=weekday,
-        map_name=map_name,
-        third_place_decider=third_place_decider,
-        db=db,
-    )
+    pid, _ = _player_id_by_name(db, name)
+    return _summary_for_player_id(db, pid, windows, weekday, map_name, third_place_only)
 
 
-@router.get("/leaders/kpr-delta")
-def kpr_delta_leaders(
-    weekday: str = Query(...),
-    window_days: int = Query(365, ge=1, le=3650),
-    limit: int = Query(10, ge=1, le=100),
-    map_name: Optional[str] = Query(None),
-    third_place_decider: Optional[bool] = Query(None),
-    min_rounds_all: int = Query(100, ge=0, le=1000000),
-    min_rounds_weekday: int = Query(30, ge=0, le=1000000),
-    db: Session = Depends(get_db),
+def _kpr_delta_board(
+    db: Session,
+    days: int,
+    weekday: str,
+    limit: int,
+    third_place_only: bool,
+    direction: str,
+    min_baseline_rounds: int,
+    min_weekday_rounds: int,
 ):
-    key = weekday.strip().lower()
-    if key not in _WEEKDAY_TO_DOW:
-        raise HTTPException(status_code=400, detail="weekday must be Monday..Sunday")
-    dow = _WEEKDAY_TO_DOW[key]
-
-    cutoff = int(time.time()) - int(window_days) * 24 * 60 * 60
-    mn = map_name.strip().lower() if map_name else None
+    dow = _parse_weekday(weekday)
+    cutoff = int(time.time()) - days * 24 * 60 * 60
 
     rounds_expr = func.coalesce(MatchMap.team1_rounds, 0) + func.coalesce(MatchMap.team2_rounds, 0)
     weight = case((rounds_expr > 0, rounds_expr), else_=None)
 
-    base_filters = [
-        PlayerMapStat.segment == "total",
-        Match.played_at.is_not(None),
-        Match.played_at >= cutoff,
-    ]
-
-    if third_place_decider is not None:
-        base_filters.append(Match.is_third_place_decider == bool(third_place_decider))
-
-    if mn:
-        base_filters.append(PlayerMapStat.map_name.is_not(None))
-        base_filters.append(func.lower(PlayerMapStat.map_name) == mn)
-
-    base_q = (
+    base = (
         select(
             PlayerMapStat.player_id.label("player_id"),
-            func.sum(func.coalesce(weight, 0)).label("rounds_all"),
-            (func.sum(cast(PlayerMapStat.kills, Float)) / func.nullif(func.sum(weight), 0)).label("kpr_all"),
+            func.sum(func.coalesce(weight, 0)).label("rounds"),
+            func.sum(func.coalesce(PlayerMapStat.kills, 0)).label("kills"),
         )
         .select_from(PlayerMapStat)
         .join(Match, Match.id == PlayerMapStat.match_id)
@@ -249,18 +228,23 @@ def kpr_delta_leaders(
                 func.lower(MatchMap.map_name) == func.lower(PlayerMapStat.map_name),
             ),
         )
-        .where(*base_filters)
-        .group_by(PlayerMapStat.player_id)
-    ).subquery("base")
+        .where(
+            PlayerMapStat.segment == "total",
+            Match.played_at.is_not(None),
+            Match.played_at >= cutoff,
+        )
+    )
 
-    wd_filters = list(base_filters)
-    wd_filters.append(func.extract("dow", func.to_timestamp(Match.played_at)) == dow)
+    if third_place_only:
+        base = base.where(Match.is_third_place_decider.is_(True))
 
-    wd_q = (
+    base = base.group_by(PlayerMapStat.player_id).subquery()
+
+    weekday_q = (
         select(
             PlayerMapStat.player_id.label("player_id"),
-            func.sum(func.coalesce(weight, 0)).label("rounds_weekday"),
-            (func.sum(cast(PlayerMapStat.kills, Float)) / func.nullif(func.sum(weight), 0)).label("kpr_weekday"),
+            func.sum(func.coalesce(weight, 0)).label("rounds"),
+            func.sum(func.coalesce(PlayerMapStat.kills, 0)).label("kills"),
         )
         .select_from(PlayerMapStat)
         .join(Match, Match.id == PlayerMapStat.match_id)
@@ -272,53 +256,100 @@ def kpr_delta_leaders(
                 func.lower(MatchMap.map_name) == func.lower(PlayerMapStat.map_name),
             ),
         )
-        .where(*wd_filters)
-        .group_by(PlayerMapStat.player_id)
-    ).subquery("wd")
+        .where(
+            PlayerMapStat.segment == "total",
+            Match.played_at.is_not(None),
+            Match.played_at >= cutoff,
+            func.extract("dow", func.to_timestamp(Match.played_at)) == dow,
+        )
+    )
 
-    delta_expr = cast(wd_q.c.kpr_weekday, Float) - cast(base_q.c.kpr_all, Float)
+    if third_place_only:
+        weekday_q = weekday_q.where(Match.is_third_place_decider.is_(True))
+
+    weekday_q = weekday_q.group_by(PlayerMapStat.player_id).subquery()
+
+    baseline_kpr = (cast(base.c.kills, Float) / func.nullif(cast(base.c.rounds, Float), 0)).label("baseline_kpr")
+    weekday_kpr = (cast(weekday_q.c.kills, Float) / func.nullif(cast(weekday_q.c.rounds, Float), 0)).label("weekday_kpr")
+    delta = (weekday_kpr - baseline_kpr).label("delta_kpr")
 
     stmt = (
         select(
             Player.id.label("player_id"),
             Player.name.label("player_name"),
-            cast(base_q.c.kpr_all, Float).label("kpr_all"),
-            cast(wd_q.c.kpr_weekday, Float).label("kpr_weekday"),
-            cast(base_q.c.rounds_all, Float).label("rounds_all"),
-            cast(wd_q.c.rounds_weekday, Float).label("rounds_weekday"),
-            delta_expr.label("kpr_delta"),
+            cast(base.c.rounds, Float).label("baseline_rounds"),
+            cast(weekday_q.c.rounds, Float).label("weekday_rounds"),
+            baseline_kpr,
+            weekday_kpr,
+            delta,
         )
         .select_from(Player)
-        .join(base_q, base_q.c.player_id == Player.id)
-        .join(wd_q, wd_q.c.player_id == Player.id)
+        .join(base, base.c.player_id == Player.id)
+        .join(weekday_q, weekday_q.c.player_id == Player.id)
         .where(
-            base_q.c.kpr_all.is_not(None),
-            wd_q.c.kpr_weekday.is_not(None),
-            base_q.c.rounds_all >= int(min_rounds_all),
-            wd_q.c.rounds_weekday >= int(min_rounds_weekday),
+            base.c.rounds >= min_baseline_rounds,
+            weekday_q.c.rounds >= min_weekday_rounds,
         )
-        .order_by(delta_expr.desc())
-        .limit(int(limit))
     )
 
+    if direction == "leaders":
+        stmt = stmt.order_by(delta.desc())
+    else:
+        stmt = stmt.order_by(delta.asc())
+
+    stmt = stmt.limit(limit)
+
     rows = db.execute(stmt).all()
-    return {
-        "weekday": weekday,
-        "window_days": int(window_days),
-        "map_name": map_name,
-        "third_place_decider": third_place_decider,
-        "min_rounds_all": int(min_rounds_all),
-        "min_rounds_weekday": int(min_rounds_weekday),
-        "leaders": [
+
+    out = []
+    for r in rows:
+        out.append(
             {
                 "player_id": int(r.player_id),
-                "player_name": r.player_name,
-                "kpr_all": float(r.kpr_all) if r.kpr_all is not None else None,
-                "kpr_weekday": float(r.kpr_weekday) if r.kpr_weekday is not None else None,
-                "kpr_delta": float(r.kpr_delta) if r.kpr_delta is not None else None,
-                "rounds_all": int(r.rounds_all or 0),
-                "rounds_weekday": int(r.rounds_weekday or 0),
+                "player_name": str(r.player_name),
+                "window_days": int(days),
+                "weekday": weekday,
+                "third_place_only": bool(third_place_only),
+                "baseline_rounds": int(r.baseline_rounds or 0),
+                "weekday_rounds": int(r.weekday_rounds or 0),
+                "baseline_kpr": float(r.baseline_kpr) if r.baseline_kpr is not None else None,
+                "weekday_kpr": float(r.weekday_kpr) if r.weekday_kpr is not None else None,
+                "delta_kpr": float(r.delta_kpr) if r.delta_kpr is not None else None,
             }
-            for r in rows
-        ],
+        )
+
+    return {
+        "window_days": int(days),
+        "weekday": weekday,
+        "third_place_only": bool(third_place_only),
+        "limit": int(limit),
+        "min_baseline_rounds": int(min_baseline_rounds),
+        "min_weekday_rounds": int(min_weekday_rounds),
+        "rows": out,
     }
+
+
+@router.get("/kpr-delta-leaders")
+def kpr_delta_leaders(
+    days: int = Query(365, ge=1, le=3650),
+    weekday: str = Query(...),
+    limit: int = Query(10, ge=1, le=100),
+    third_place_only: bool = Query(False),
+    min_baseline_rounds: int = Query(200, ge=0, le=1000000),
+    min_weekday_rounds: int = Query(50, ge=0, le=1000000),
+    db: Session = Depends(get_db),
+):
+    return _kpr_delta_board(db, days, weekday, limit, third_place_only, "leaders", min_baseline_rounds, min_weekday_rounds)
+
+
+@router.get("/kpr-delta-laggards")
+def kpr_delta_laggards(
+    days: int = Query(365, ge=1, le=3650),
+    weekday: str = Query(...),
+    limit: int = Query(10, ge=1, le=100),
+    third_place_only: bool = Query(False),
+    min_baseline_rounds: int = Query(200, ge=0, le=1000000),
+    min_weekday_rounds: int = Query(50, ge=0, le=1000000),
+    db: Session = Depends(get_db),
+):
+    return _kpr_delta_board(db, days, weekday, limit, third_place_only, "laggards", min_baseline_rounds, min_weekday_rounds)
