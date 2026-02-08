@@ -196,3 +196,129 @@ def player_summary_by_name(
         third_place_decider=third_place_decider,
         db=db,
     )
+
+
+@router.get("/leaders/kpr-delta")
+def kpr_delta_leaders(
+    weekday: str = Query(...),
+    window_days: int = Query(365, ge=1, le=3650),
+    limit: int = Query(10, ge=1, le=100),
+    map_name: Optional[str] = Query(None),
+    third_place_decider: Optional[bool] = Query(None),
+    min_rounds_all: int = Query(100, ge=0, le=1000000),
+    min_rounds_weekday: int = Query(30, ge=0, le=1000000),
+    db: Session = Depends(get_db),
+):
+    key = weekday.strip().lower()
+    if key not in _WEEKDAY_TO_DOW:
+        raise HTTPException(status_code=400, detail="weekday must be Monday..Sunday")
+    dow = _WEEKDAY_TO_DOW[key]
+
+    cutoff = int(time.time()) - int(window_days) * 24 * 60 * 60
+    mn = map_name.strip().lower() if map_name else None
+
+    rounds_expr = func.coalesce(MatchMap.team1_rounds, 0) + func.coalesce(MatchMap.team2_rounds, 0)
+    weight = case((rounds_expr > 0, rounds_expr), else_=None)
+
+    base_filters = [
+        PlayerMapStat.segment == "total",
+        Match.played_at.is_not(None),
+        Match.played_at >= cutoff,
+    ]
+
+    if third_place_decider is not None:
+        base_filters.append(Match.is_third_place_decider == bool(third_place_decider))
+
+    if mn:
+        base_filters.append(PlayerMapStat.map_name.is_not(None))
+        base_filters.append(func.lower(PlayerMapStat.map_name) == mn)
+
+    base_q = (
+        select(
+            PlayerMapStat.player_id.label("player_id"),
+            func.sum(func.coalesce(weight, 0)).label("rounds_all"),
+            (func.sum(cast(PlayerMapStat.kills, Float)) / func.nullif(func.sum(weight), 0)).label("kpr_all"),
+        )
+        .select_from(PlayerMapStat)
+        .join(Match, Match.id == PlayerMapStat.match_id)
+        .outerjoin(
+            MatchMap,
+            and_(
+                MatchMap.match_id == PlayerMapStat.match_id,
+                PlayerMapStat.map_name.is_not(None),
+                func.lower(MatchMap.map_name) == func.lower(PlayerMapStat.map_name),
+            ),
+        )
+        .where(*base_filters)
+        .group_by(PlayerMapStat.player_id)
+    ).subquery("base")
+
+    wd_filters = list(base_filters)
+    wd_filters.append(func.extract("dow", func.to_timestamp(Match.played_at)) == dow)
+
+    wd_q = (
+        select(
+            PlayerMapStat.player_id.label("player_id"),
+            func.sum(func.coalesce(weight, 0)).label("rounds_weekday"),
+            (func.sum(cast(PlayerMapStat.kills, Float)) / func.nullif(func.sum(weight), 0)).label("kpr_weekday"),
+        )
+        .select_from(PlayerMapStat)
+        .join(Match, Match.id == PlayerMapStat.match_id)
+        .outerjoin(
+            MatchMap,
+            and_(
+                MatchMap.match_id == PlayerMapStat.match_id,
+                PlayerMapStat.map_name.is_not(None),
+                func.lower(MatchMap.map_name) == func.lower(PlayerMapStat.map_name),
+            ),
+        )
+        .where(*wd_filters)
+        .group_by(PlayerMapStat.player_id)
+    ).subquery("wd")
+
+    delta_expr = cast(wd_q.c.kpr_weekday, Float) - cast(base_q.c.kpr_all, Float)
+
+    stmt = (
+        select(
+            Player.id.label("player_id"),
+            Player.name.label("player_name"),
+            cast(base_q.c.kpr_all, Float).label("kpr_all"),
+            cast(wd_q.c.kpr_weekday, Float).label("kpr_weekday"),
+            cast(base_q.c.rounds_all, Float).label("rounds_all"),
+            cast(wd_q.c.rounds_weekday, Float).label("rounds_weekday"),
+            delta_expr.label("kpr_delta"),
+        )
+        .select_from(Player)
+        .join(base_q, base_q.c.player_id == Player.id)
+        .join(wd_q, wd_q.c.player_id == Player.id)
+        .where(
+            base_q.c.kpr_all.is_not(None),
+            wd_q.c.kpr_weekday.is_not(None),
+            base_q.c.rounds_all >= int(min_rounds_all),
+            wd_q.c.rounds_weekday >= int(min_rounds_weekday),
+        )
+        .order_by(delta_expr.desc())
+        .limit(int(limit))
+    )
+
+    rows = db.execute(stmt).all()
+    return {
+        "weekday": weekday,
+        "window_days": int(window_days),
+        "map_name": map_name,
+        "third_place_decider": third_place_decider,
+        "min_rounds_all": int(min_rounds_all),
+        "min_rounds_weekday": int(min_rounds_weekday),
+        "leaders": [
+            {
+                "player_id": int(r.player_id),
+                "player_name": r.player_name,
+                "kpr_all": float(r.kpr_all) if r.kpr_all is not None else None,
+                "kpr_weekday": float(r.kpr_weekday) if r.kpr_weekday is not None else None,
+                "kpr_delta": float(r.kpr_delta) if r.kpr_delta is not None else None,
+                "rounds_all": int(r.rounds_all or 0),
+                "rounds_weekday": int(r.rounds_weekday or 0),
+            }
+            for r in rows
+        ],
+    }
