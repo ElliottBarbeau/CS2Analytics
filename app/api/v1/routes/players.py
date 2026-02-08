@@ -52,6 +52,7 @@ def _player_summary_impl(
     windows: str,
     weekday: Optional[str],
     map_name: Optional[str],
+    third_place_decider: Optional[bool],
     db: Session,
 ):
     w = []
@@ -117,6 +118,9 @@ def _player_summary_impl(
             )
         )
 
+        if third_place_decider is not None:
+            stmt = stmt.where(Match.is_third_place_decider == bool(third_place_decider))
+
         if mn:
             stmt = stmt.where(PlayerMapStat.map_name.is_not(None), func.lower(PlayerMapStat.map_name) == mn)
 
@@ -145,6 +149,7 @@ def _player_summary_impl(
         "player_query": player_name_echo,
         "weekday": weekday,
         "map_name": map_name,
+        "third_place_decider": third_place_decider,
         "windows": [one_window(days) for days in w],
     }
 
@@ -155,6 +160,7 @@ def player_summary(
     windows: str = Query("30,90,365"),
     weekday: Optional[str] = Query(None),
     map_name: Optional[str] = Query(None),
+    third_place_decider: Optional[bool] = Query(None),
     db: Session = Depends(get_db),
 ):
     return _player_summary_impl(
@@ -163,6 +169,7 @@ def player_summary(
         windows=windows,
         weekday=weekday,
         map_name=map_name,
+        third_place_decider=third_place_decider,
         db=db,
     )
 
@@ -173,6 +180,7 @@ def player_summary_by_name(
     windows: str = Query("30,90,365"),
     weekday: Optional[str] = Query(None),
     map_name: Optional[str] = Query(None),
+    third_place_decider: Optional[bool] = Query(None),
     db: Session = Depends(get_db),
 ):
     nm = name.strip().lower()
@@ -185,5 +193,6 @@ def player_summary_by_name(
         windows=windows,
         weekday=weekday,
         map_name=map_name,
+        third_place_decider=third_place_decider,
         db=db,
     )
