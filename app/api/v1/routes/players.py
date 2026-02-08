@@ -97,6 +97,7 @@ def player_summary(
                 (func.sum(cast(PlayerMapStat.rating3, Float) * weight) / func.nullif(func.sum(weight), 0)).label("rating3"),
                 (func.sum(cast(PlayerMapStat.adr, Float) * weight) / func.nullif(func.sum(weight), 0)).label("adr"),
                 (func.sum(cast(PlayerMapStat.kast, Float) * weight) / func.nullif(func.sum(weight), 0)).label("kast"),
+                (func.sum(cast(PlayerMapStat.kills, Float)) / func.nullif(func.sum(weight), 0)).label("kpr"),
             )
             .select_from(PlayerMapStat)
             .join(Match, Match.id == PlayerMapStat.match_id)
@@ -136,6 +137,7 @@ def player_summary(
             "rating3": float(row.rating3) if row.rating3 is not None else None,
             "adr": float(row.adr) if row.adr is not None else None,
             "kast": float(row.kast) if row.kast is not None else None,
+            "kpr": float(row.kpr) if row.kpr is not None else None,
             "kills": int(row.kills or 0),
             "deaths": int(row.deaths or 0),
             "assists": int(row.assists or 0),
