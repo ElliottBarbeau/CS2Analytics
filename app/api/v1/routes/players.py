@@ -46,13 +46,13 @@ def player_by_name(name: str, db: Session = Depends(get_db)):
     return {"id": int(row.id), "name": row.name}
 
 
-@router.get("/{player_id}/summary")
-def player_summary(
+def _player_summary_impl(
     player_id: int,
-    windows: str = Query("30,90,365"),
-    weekday: Optional[str] = Query(None),
-    map_name: Optional[str] = Query(None),
-    db: Session = Depends(get_db),
+    player_name_echo: Optional[str],
+    windows: str,
+    weekday: Optional[str],
+    map_name: Optional[str],
+    db: Session,
 ):
     w = []
     for part in windows.split(","):
@@ -86,7 +86,7 @@ def player_summary(
         rounds_expr = func.coalesce(MatchMap.team1_rounds, 0) + func.coalesce(MatchMap.team2_rounds, 0)
         weight = case((rounds_expr > 0, rounds_expr), else_=None)
 
-        base = (
+        stmt = (
             select(
                 func.count(func.distinct(PlayerMapStat.stats_match_id)).label("maps"),
                 func.count(func.distinct(PlayerMapStat.match_id)).label("matches"),
@@ -118,22 +118,18 @@ def player_summary(
         )
 
         if mn:
-            base = base.where(PlayerMapStat.map_name.is_not(None), func.lower(PlayerMapStat.map_name) == mn)
+            stmt = stmt.where(PlayerMapStat.map_name.is_not(None), func.lower(PlayerMapStat.map_name) == mn)
 
         if dow is not None:
-            base = base.where(func.extract("dow", func.to_timestamp(Match.played_at)) == dow)
+            stmt = stmt.where(func.extract("dow", func.to_timestamp(Match.played_at)) == dow)
 
-        row = db.execute(base).first()
-
-        maps = int(row.maps or 0)
-        matches = int(row.matches or 0)
-        rounds = int(row.rounds or 0)
+        row = db.execute(stmt).first()
 
         return {
             "window_days": days,
-            "matches": matches,
-            "maps": maps,
-            "rounds": rounds,
+            "matches": int(row.matches or 0),
+            "maps": int(row.maps or 0),
+            "rounds": int(row.rounds or 0),
             "rating3": float(row.rating3) if row.rating3 is not None else None,
             "adr": float(row.adr) if row.adr is not None else None,
             "kast": float(row.kast) if row.kast is not None else None,
@@ -146,7 +142,48 @@ def player_summary(
     return {
         "player_id": int(player_row.id),
         "player_name": player_row.name,
+        "player_query": player_name_echo,
         "weekday": weekday,
         "map_name": map_name,
         "windows": [one_window(days) for days in w],
     }
+
+
+@router.get("/{player_id}/summary")
+def player_summary(
+    player_id: int,
+    windows: str = Query("30,90,365"),
+    weekday: Optional[str] = Query(None),
+    map_name: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    return _player_summary_impl(
+        player_id=player_id,
+        player_name_echo=None,
+        windows=windows,
+        weekday=weekday,
+        map_name=map_name,
+        db=db,
+    )
+
+
+@router.get("/summary/by-name/{name}")
+def player_summary_by_name(
+    name: str,
+    windows: str = Query("30,90,365"),
+    weekday: Optional[str] = Query(None),
+    map_name: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    nm = name.strip().lower()
+    row = db.execute(select(Player.id).where(func.lower(Player.name) == nm)).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Player not found")
+    return _player_summary_impl(
+        player_id=int(row.id),
+        player_name_echo=name,
+        windows=windows,
+        weekday=weekday,
+        map_name=map_name,
+        db=db,
+    )
