@@ -26,7 +26,6 @@ class PlayerMapStat(Base):
     deaths: Mapped[int | None] = mapped_column(Integer, nullable=True)
     assists: Mapped[int | None] = mapped_column(Integer, nullable=True)
     hs_kills: Mapped[int | None] = mapped_column(Integer, nullable=True)
-
     adr: Mapped[float | None] = mapped_column(Float, nullable=True)
     kast: Mapped[float | None] = mapped_column(Float, nullable=True)
     rating3: Mapped[float | None] = mapped_column(Float, nullable=True)
