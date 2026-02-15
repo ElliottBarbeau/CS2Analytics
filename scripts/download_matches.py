@@ -537,6 +537,31 @@ def read_match_urls_from_csv(path: Path, url_column: str) -> List[str]:
     return urls
 
 
+def read_existing_match_ids(jsonl_path: Path) -> set[int]:
+    existing: set[int] = set()
+    if not jsonl_path.exists():
+        return existing
+
+    with jsonl_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+
+            match_id = obj.get("match_id")
+            if isinstance(match_id, int):
+                existing.add(match_id)
+                continue
+            if isinstance(match_id, str) and match_id.isdigit():
+                existing.add(int(match_id))
+
+    return existing
+
+
 def _find_maps_box_text(match_html: str) -> Optional[str]:
     soup = BeautifulSoup(match_html, "html.parser")
 
@@ -755,6 +780,9 @@ def main() -> None:
     scraper = cloudscraper.create_scraper()
 
     match_urls = read_match_urls_from_csv(csv_path, args.url_column)
+    existing_match_ids = read_existing_match_ids(out_path)
+    if existing_match_ids:
+        match_urls = [u for u in match_urls if (extract_match_id(u) or -1) not in existing_match_ids]
     if args.max_matches is not None:
         match_urls = match_urls[: max(0, args.max_matches)]
 
@@ -791,7 +819,7 @@ def main() -> None:
     if first_url_hard_fail:
         raise SystemExit(3)
 
-    with out_path.open("w", encoding="utf-8") as fout:
+    with out_path.open("a", encoding="utf-8") as fout:
         for idx, match_url in enumerate(tqdm(match_urls, desc=f"Fetching HLTV team={args.team}")):
             match_id = extract_match_id(match_url)
             if match_id is None:
