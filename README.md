@@ -1,17 +1,16 @@
-# CS2Analytics
-Analytics for CS2 including hltv fantasy predictor
+# CS2 Analytics
 
-# TODO
+Analytics API for Counter-Strike 2 match and player statistics.
 
-Add APIs for the following:
+## Live API
 
-- Calculate team elos on each map (this structure is already outlined in another project of mine for Anubis)
-- Use individual map stats to predict future player performance in matchups for tournaments
-- Create data analytics for performance trends, map pool strengths, vetoes, etc
+API Docs: https://cs2analytics.onrender.com/docs
+Health Check: https://cs2analytics.onrender.com/health
 
-More specifically:
-- Map pool stats
-    - Winrate by map (strength adjusted for each team)
-    - Per-event performance
-    - Rolling form in last N maps / last M days
-    
+## Tech Stack
+
+- FastAPI
+- PostgreSQL (Neon)
+- SQLAlchemy 2.0
+- Docker
+- pytest
