@@ -6,6 +6,15 @@ from app.api.v1.router import api_router
 app = FastAPI(title="CS2 Analytics API")
 app.include_router(api_router, prefix="/api/v1")
 
+@app.get("/")
+def root():
+    return {
+        "project": "CS2 Analytics API",
+        "status": "running",
+        "docs": "/docs",
+        "health": "/health"
+    }
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
