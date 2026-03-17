@@ -28,11 +28,7 @@ It is designed to support analytics queries with low latency using PostgreSQL
 
 ## Architecture
 
-Client (HTTP)
-↓
-FastAPI (Render)
-↓
-PostgreSQL (Neon)
+Client (HTTP) -> FastAPI (Render) -> PostgreSQL (Neon)
 
 ---
 
