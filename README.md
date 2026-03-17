@@ -5,6 +5,7 @@ Backend service for analyzing Counter-Strike 2 match and player statistics.
 ## Live API
 
 API Docs: https://cs2analytics.onrender.com/docs
+
 Health Check: https://cs2analytics.onrender.com/health
 
 ---
